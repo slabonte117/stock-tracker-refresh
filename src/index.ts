@@ -18,6 +18,17 @@ type FinnhubQuoteResponse = {
   t: number;
 };
 
+type RetryCallback = (details: {
+  service: "Finnhub" | "Notion";
+  attempt: number;
+  delayMs: number;
+  status?: number;
+}) => void;
+
+const FINNHUB_MAX_ATTEMPTS = 3;
+const NOTION_MAX_ATTEMPTS = 3;
+const MAX_RETRY_DELAY_MS = 10_000;
+
 const stockRefreshRuns = worker.database("stockRefreshRuns", {
   type: "managed",
   initialTitle: "Stock Refresh Runs",
@@ -35,877 +46,6 @@ const stockRefreshRuns = worker.database("stockRefreshRuns", {
     },
   },
 });
-
-async function fetchFinnhubQuote(symbol: string): Promise<Quote> {
-  const apiKey = process.env.FINNHUB_API_KEY;
-
-  if (!apiKey) {
-    throw new Error("FINNHUB_API_KEY is not configured.");
-  }
-
-  const url =
-    `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}`;
-
-  const response = await fetch(url, {
-    headers: {
-      "X-Finnhub-Token": apiKey,
-    },
-  });
-
-  if (!response.ok) {
-    throw new Error(
-      `Finnhub request for ${symbol} failed with HTTP ${response.status}.`,
-    );
-  }
-
-  const raw = (await response.json()) as Partial<FinnhubQuoteResponse>;
-
-  if (
-    typeof raw.c !== "number" ||
-    typeof raw.dp !== "number" ||
-    typeof raw.t !== "number" ||
-    !Number.isFinite(raw.c) ||
-    !Number.isFinite(raw.dp) ||
-    !Number.isFinite(raw.t) ||
-    raw.c <= 0 ||
-    raw.t <= 0
-  ) {
-    throw new Error(`Finnhub returned an invalid quote for ${symbol}.`);
-  }
-
-  return {
-    symbol,
-    marketPrice: raw.c,
-    dayChangeDecimal: raw.dp / 100,
-    quotedAt: new Date(raw.t * 1000).toISOString(),
-  };
-}
-
-worker.sync("stockRefreshSmokeTest", {
-  database: stockRefreshRuns,
-  mode: "incremental",
-  schedule: "manual",
-  execute: async () => {
-    const executedAt = new Date().toISOString();
-    const runId = `smoke-${executedAt}`;
-
-    return {
-      changes: [
-        {
-          type: "upsert" as const,
-          key: runId,
-          properties: {
-            "Run ID": Builder.title(runId),
-            Status: Builder.select("Smoke test"),
-            "Executed At": Builder.richText(executedAt),
-            Summary: Builder.richText(
-              "Hosted Worker smoke test. No market API or Stock Tracker access.",
-            ),
-          },
-        },
-      ],
-      hasMore: false,
-    };
-  },
-});
-
-worker.sync("quoteProviderTest", {
-  database: stockRefreshRuns,
-  mode: "incremental",
-  schedule: "manual",
-  execute: async () => {
-    const executedAt = new Date().toISOString();
-    const runId = `provider-test-${executedAt}`;
-
-    try {
-      const quotes: Quote[] = [];
-
-      for (const symbol of ["AAPL", "VTI"]) {
-        quotes.push(await fetchFinnhubQuote(symbol));
-      }
-
-      return {
-        changes: [
-          {
-            type: "upsert" as const,
-            key: runId,
-            properties: {
-              "Run ID": Builder.title(runId),
-              Status: Builder.select("Success"),
-              "Executed At": Builder.richText(executedAt),
-              Summary: Builder.richText(
-                JSON.stringify({
-                  provider: "Finnhub",
-                  symbols: ["AAPL", "VTI"],
-                  quotes,
-                }),
-              ),
-            },
-          },
-        ],
-        hasMore: false,
-      };
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Unknown provider error.";
-
-      return {
-        changes: [
-          {
-            type: "upsert" as const,
-            key: runId,
-            properties: {
-              "Run ID": Builder.title(runId),
-              Status: Builder.select("Failed"),
-              "Executed At": Builder.richText(executedAt),
-              Summary: Builder.richText(message),
-            },
-          },
-        ],
-        hasMore: false,
-      };
-    }
-  },
-});
-
-function extractSymbol(page: unknown): string {
-  const properties = (
-    page as {
-      properties?: Record<string, unknown>;
-    }
-  ).properties;
-
-  const symbolProperty = properties?.Symbol as
-    | {
-        type?: string;
-        title?: Array<{ plain_text?: string }>;
-      }
-    | undefined;
-
-  if (
-    symbolProperty?.type !== "title" ||
-    !Array.isArray(symbolProperty.title)
-  ) {
-    return "";
-  }
-
-  return symbolProperty.title
-    .map((item) => item.plain_text ?? "")
-    .join("")
-    .trim()
-    .toUpperCase();
-}
-
-worker.sync("stockTrackerReadTest", {
-  database: stockRefreshRuns,
-  mode: "incremental",
-  schedule: "manual",
-  execute: async (_state, { notion }) => {
-    const executedAt = new Date().toISOString();
-    const runId = `tracker-read-${executedAt}`;
-
-    try {
-      const searchResponse = await notion.search({
-        filter: {
-          property: "object",
-          value: "data_source",
-        },
-        page_size: 10,
-      });
-
-      if (searchResponse.results.length !== 1) {
-        throw new Error(
-          `Expected exactly one accessible data source; found ${searchResponse.results.length}.`,
-        );
-      }
-
-      const dataSourceId = searchResponse.results[0].id;
-      const symbols: string[] = [];
-      let rowsFound = 0;
-      let cursor: string | undefined;
-
-      do {
-        const response = await notion.dataSources.query({
-          data_source_id: dataSourceId,
-          page_size: 100,
-          start_cursor: cursor,
-        });
-
-        rowsFound += response.results.length;
-
-        for (const page of response.results) {
-          const symbol = extractSymbol(page);
-
-          if (symbol) {
-            symbols.push(symbol);
-          }
-        }
-
-        cursor =
-          response.has_more && response.next_cursor
-            ? response.next_cursor
-            : undefined;
-      } while (cursor);
-
-      const symbolCounts = new Map<string, number>();
-
-      for (const symbol of symbols) {
-        symbolCounts.set(symbol, (symbolCounts.get(symbol) ?? 0) + 1);
-      }
-
-      const duplicateSymbols = [...symbolCounts.entries()]
-        .filter(([, count]) => count > 1)
-        .map(([symbol, count]) => ({ symbol, count }));
-
-      const summary = {
-        test: "Stock Tracker read-only access",
-        dataSourceId,
-        rowsFound,
-        populatedSymbols: symbols.length,
-        blankSymbols: rowsFound - symbols.length,
-        uniqueSymbols: symbolCounts.size,
-        duplicateSymbols,
-        writesAttempted: 0,
-      };
-
-      return {
-        changes: [
-          {
-            type: "upsert" as const,
-            key: runId,
-            properties: {
-              "Run ID": Builder.title(runId),
-              Status: Builder.select("Success"),
-              "Executed At": Builder.richText(executedAt),
-              Summary: Builder.richText(JSON.stringify(summary)),
-            },
-          },
-        ],
-        hasMore: false,
-      };
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Unknown read-test error.";
-
-      return {
-        changes: [
-          {
-            type: "upsert" as const,
-            key: runId,
-            properties: {
-              "Run ID": Builder.title(runId),
-              Status: Builder.select("Failed"),
-              "Executed At": Builder.richText(executedAt),
-              Summary: Builder.richText(message),
-            },
-          },
-        ],
-        hasMore: false,
-      };
-    }
-  },
-});
-
-function toChicagoDate(isoTimestamp: string): string {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/Chicago",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(new Date(isoTimestamp));
-
-  const values = Object.fromEntries(
-    parts.map((part) => [part.type, part.value]),
-  );
-
-  if (!values.year || !values.month || !values.day) {
-    throw new Error("Could not convert quote timestamp to a Chicago date.");
-  }
-
-  return `${values.year}-${values.month}-${values.day}`;
-}
-
-function registerAaplUpdateCapability(
-  capabilityKey: string,
-  performWrite: boolean,
-) {
-  worker.sync(capabilityKey, {
-    database: stockRefreshRuns,
-    mode: "incremental",
-    schedule: "manual",
-    execute: async (_state, { notion }) => {
-      const executedAt = new Date().toISOString();
-      const mode = performWrite ? "write" : "dry-run";
-      const runId = `aapl-${mode}-${executedAt}`;
-
-      try {
-        const searchResponse = await notion.search({
-          filter: {
-            property: "object",
-            value: "data_source",
-          },
-          page_size: 10,
-        });
-
-        if (searchResponse.results.length !== 1) {
-          throw new Error(
-            `Expected exactly one accessible data source; found ${searchResponse.results.length}.`,
-          );
-        }
-
-        const dataSourceId = searchResponse.results[0].id;
-
-        const queryResponse = await notion.dataSources.query({
-          data_source_id: dataSourceId,
-          filter: {
-            property: "Symbol",
-            title: {
-              equals: "AAPL",
-            },
-          },
-          page_size: 10,
-        });
-
-        if (queryResponse.results.length !== 1) {
-          throw new Error(
-            `Expected exactly one AAPL row; found ${queryResponse.results.length}.`,
-          );
-        }
-
-        const page = queryResponse.results[0] as {
-          id: string;
-          properties: Record<string, unknown>;
-        };
-
-        const ownedProperty = page.properties.Owned as
-          | { type?: string; checkbox?: boolean }
-          | undefined;
-
-        if (
-          ownedProperty?.type !== "checkbox" ||
-          ownedProperty.checkbox !== false
-        ) {
-          throw new Error(
-            "AAPL is not confirmed as a non-owned test row. Update blocked.",
-          );
-        }
-
-        const currentMarketPrice =
-          (
-            page.properties["Market Price"] as
-              | { type?: string; number?: number | null }
-              | undefined
-          )?.number ?? null;
-
-        const currentDayChange =
-          (
-            page.properties["Day Change %"] as
-              | { type?: string; number?: number | null }
-              | undefined
-          )?.number ?? null;
-
-        const currentSnapshotDate =
-          (
-            page.properties["Snapshot Date"] as
-              | {
-                  type?: string;
-                  date?: { start?: string } | null;
-                }
-              | undefined
-          )?.date?.start ?? null;
-
-        const quote = await fetchFinnhubQuote("AAPL");
-        const snapshotDate = toChicagoDate(quote.quotedAt);
-
-        const before = {
-          marketPrice: currentMarketPrice,
-          dayChangeDecimal: currentDayChange,
-          snapshotDate: currentSnapshotDate,
-        };
-
-        const proposed = {
-          marketPrice: quote.marketPrice,
-          dayChangeDecimal: quote.dayChangeDecimal,
-          snapshotDate,
-        };
-
-        if (performWrite) {
-          await notion.pages.update({
-            page_id: page.id,
-            properties: {
-              "Market Price": {
-                number: proposed.marketPrice,
-              },
-              "Day Change %": {
-                number: proposed.dayChangeDecimal,
-              },
-              "Snapshot Date": {
-                date: {
-                  start: proposed.snapshotDate,
-                },
-              },
-            },
-          });
-        }
-
-        const summary = {
-          test: "Controlled AAPL update",
-          mode,
-          symbol: "AAPL",
-          owned: false,
-          pageId: page.id,
-          before,
-          proposed,
-          propertiesTargeted: [
-            "Market Price",
-            "Day Change %",
-            "Snapshot Date",
-          ],
-          writesPerformed: performWrite ? 1 : 0,
-        };
-
-        return {
-          changes: [
-            {
-              type: "upsert" as const,
-              key: runId,
-              properties: {
-                "Run ID": Builder.title(runId),
-                Status: Builder.select("Success"),
-                "Executed At": Builder.richText(executedAt),
-                Summary: Builder.richText(JSON.stringify(summary)),
-              },
-            },
-          ],
-          hasMore: false,
-        };
-      } catch (error) {
-        const message =
-          error instanceof Error
-            ? error.message
-            : "Unknown controlled-update error.";
-
-        return {
-          changes: [
-            {
-              type: "upsert" as const,
-              key: runId,
-              properties: {
-                "Run ID": Builder.title(runId),
-                Status: Builder.select("Failed"),
-                "Executed At": Builder.richText(executedAt),
-                Summary: Builder.richText(message),
-              },
-            },
-          ],
-          hasMore: false,
-        };
-      }
-    },
-  });
-}
-
-registerAaplUpdateCapability("aaplUpdateDryRun", false);
-registerAaplUpdateCapability("aaplControlledUpdate", true);
-
-function registerTwoSymbolUpdateCapability(
-  capabilityKey: string,
-  performWrite: boolean,
-) {
-  worker.sync(capabilityKey, {
-    database: stockRefreshRuns,
-    mode: "incremental",
-    schedule: "manual",
-    execute: async (_state, { notion }) => {
-      const executedAt = new Date().toISOString();
-      const mode = performWrite ? "write" : "dry-run";
-      const runId = `two-symbol-${mode}-${executedAt}`;
-      let writesPerformed = 0;
-
-      try {
-        const searchResponse = await notion.search({
-          filter: {
-            property: "object",
-            value: "data_source",
-          },
-          page_size: 10,
-        });
-
-        if (searchResponse.results.length !== 1) {
-          throw new Error(
-            `Expected exactly one accessible data source; found ${searchResponse.results.length}.`,
-          );
-        }
-
-        const dataSourceId = searchResponse.results[0].id;
-        const plans: Array<{
-          symbol: string;
-          pageId: string;
-          before: {
-            marketPrice: number | null;
-            dayChangeDecimal: number | null;
-            snapshotDate: string | null;
-          };
-          proposed: {
-            marketPrice: number;
-            dayChangeDecimal: number;
-            snapshotDate: string;
-          };
-        }> = [];
-
-        for (const symbol of ["AAPL", "TSLA"]) {
-          const queryResponse = await notion.dataSources.query({
-            data_source_id: dataSourceId,
-            filter: {
-              property: "Symbol",
-              title: {
-                equals: symbol,
-              },
-            },
-            page_size: 10,
-          });
-
-          if (queryResponse.results.length !== 1) {
-            throw new Error(
-              `Expected exactly one ${symbol} row; found ${queryResponse.results.length}.`,
-            );
-          }
-
-          const page = queryResponse.results[0] as {
-            id: string;
-            properties: Record<string, unknown>;
-          };
-
-          const owned =
-            (
-              page.properties.Owned as
-                | { type?: string; checkbox?: boolean }
-                | undefined
-            )?.checkbox ?? null;
-
-          if (owned !== false) {
-            throw new Error(
-              `${symbol} is not confirmed as non-owned. Batch blocked.`,
-            );
-          }
-
-          const quote = await fetchFinnhubQuote(symbol);
-
-          plans.push({
-            symbol,
-            pageId: page.id,
-            before: {
-              marketPrice:
-                (
-                  page.properties["Market Price"] as
-                    | { number?: number | null }
-                    | undefined
-                )?.number ?? null,
-              dayChangeDecimal:
-                (
-                  page.properties["Day Change %"] as
-                    | { number?: number | null }
-                    | undefined
-                )?.number ?? null,
-              snapshotDate:
-                (
-                  page.properties["Snapshot Date"] as
-                    | { date?: { start?: string } | null }
-                    | undefined
-                )?.date?.start ?? null,
-            },
-            proposed: {
-              marketPrice: quote.marketPrice,
-              dayChangeDecimal: quote.dayChangeDecimal,
-              snapshotDate: toChicagoDate(quote.quotedAt),
-            },
-          });
-        }
-
-        if (performWrite) {
-          for (const plan of plans) {
-            await notion.pages.update({
-              page_id: plan.pageId,
-              properties: {
-                "Market Price": {
-                  number: plan.proposed.marketPrice,
-                },
-                "Day Change %": {
-                  number: plan.proposed.dayChangeDecimal,
-                },
-                "Snapshot Date": {
-                  date: {
-                    start: plan.proposed.snapshotDate,
-                  },
-                },
-              },
-            });
-
-            writesPerformed += 1;
-          }
-        }
-
-        const summary = {
-          test: "Two-symbol controlled update",
-          mode,
-          symbols: ["AAPL", "TSLA"],
-          plans,
-          propertiesTargeted: [
-            "Market Price",
-            "Day Change %",
-            "Snapshot Date",
-          ],
-          writesPerformed,
-        };
-
-        return {
-          changes: [
-            {
-              type: "upsert" as const,
-              key: runId,
-              properties: {
-                "Run ID": Builder.title(runId),
-                Status: Builder.select("Success"),
-                "Executed At": Builder.richText(executedAt),
-                Summary: Builder.richText(JSON.stringify(summary)),
-              },
-            },
-          ],
-          hasMore: false,
-        };
-      } catch (error) {
-        const message =
-          error instanceof Error
-            ? error.message
-            : "Unknown two-symbol update error.";
-
-        return {
-          changes: [
-            {
-              type: "upsert" as const,
-              key: runId,
-              properties: {
-                "Run ID": Builder.title(runId),
-                Status: Builder.select("Failed"),
-                "Executed At": Builder.richText(executedAt),
-                Summary: Builder.richText(
-                  JSON.stringify({
-                    message,
-                    writesPerformed,
-                  }),
-                ),
-              },
-            },
-          ],
-          hasMore: false,
-        };
-      }
-    },
-  });
-}
-
-registerTwoSymbolUpdateCapability("twoSymbolUpdateDryRun", false);
-registerTwoSymbolUpdateCapability("twoSymbolControlledUpdate", true);
-
-const TEN_SYMBOL_TEST = [
-  "AAPL",
-  "TSLA",
-  "ROKT",
-  "UFO",
-  "ARKX",
-  "FITE",
-  "PPA",
-  "ITA",
-  "XAR",
-  "BOTZ",
-] as const;
-
-function registerNonOwnedBatchCapability(
-  capabilityKey: string,
-  symbols: readonly string[],
-  performWrite: boolean,
-) {
-  worker.sync(capabilityKey, {
-    database: stockRefreshRuns,
-    mode: "incremental",
-    schedule: "manual",
-    execute: async (_state, { notion }) => {
-      const executedAt = new Date().toISOString();
-      const mode = performWrite ? "write" : "dry-run";
-      const runId = `non-owned-${symbols.length}-${mode}-${executedAt}`;
-      let writesPerformed = 0;
-
-      try {
-        const searchResponse = await notion.search({
-          filter: {
-            property: "object",
-            value: "data_source",
-          },
-          page_size: 10,
-        });
-
-        if (searchResponse.results.length !== 1) {
-          throw new Error(
-            `Expected exactly one accessible data source; found ${searchResponse.results.length}.`,
-          );
-        }
-
-        const dataSourceId = searchResponse.results[0].id;
-        const plans: Array<{
-          symbol: string;
-          pageId: string;
-          marketPrice: number;
-          dayChangeDecimal: number;
-          snapshotDate: string;
-        }> = [];
-
-        for (const symbol of symbols) {
-          const queryResponse = await notion.dataSources.query({
-            data_source_id: dataSourceId,
-            filter: {
-              property: "Symbol",
-              title: {
-                equals: symbol,
-              },
-            },
-            page_size: 10,
-          });
-
-          if (queryResponse.results.length !== 1) {
-            throw new Error(
-              `Expected exactly one ${symbol} row; found ${queryResponse.results.length}.`,
-            );
-          }
-
-          const page = queryResponse.results[0] as {
-            id: string;
-            properties: Record<string, unknown>;
-          };
-
-          const owned =
-            (
-              page.properties.Owned as
-                | { type?: string; checkbox?: boolean }
-                | undefined
-            )?.checkbox ?? null;
-
-          if (owned !== false) {
-            throw new Error(
-              `${symbol} is not confirmed as non-owned. Batch blocked.`,
-            );
-          }
-
-          const quote = await fetchFinnhubQuote(symbol);
-
-          plans.push({
-            symbol,
-            pageId: page.id,
-            marketPrice: quote.marketPrice,
-            dayChangeDecimal: quote.dayChangeDecimal,
-            snapshotDate: toChicagoDate(quote.quotedAt),
-          });
-        }
-
-        if (performWrite) {
-          for (const plan of plans) {
-            await notion.pages.update({
-              page_id: plan.pageId,
-              properties: {
-                "Market Price": {
-                  number: plan.marketPrice,
-                },
-                "Day Change %": {
-                  number: plan.dayChangeDecimal,
-                },
-                "Snapshot Date": {
-                  date: {
-                    start: plan.snapshotDate,
-                  },
-                },
-              },
-            });
-
-            writesPerformed += 1;
-          }
-        }
-
-        const summary = {
-          test: "Ten-symbol non-owned batch",
-          mode,
-          symbolsRequested: symbols.length,
-          quotesReceived: plans.length,
-          allRowsConfirmedNonOwned: true,
-          plans: plans.map((plan) => ({
-            symbol: plan.symbol,
-            marketPrice: plan.marketPrice,
-            dayChangeDecimal: plan.dayChangeDecimal,
-            snapshotDate: plan.snapshotDate,
-          })),
-          propertiesTargeted: [
-            "Market Price",
-            "Day Change %",
-            "Snapshot Date",
-          ],
-          writesPerformed,
-        };
-
-        return {
-          changes: [
-            {
-              type: "upsert" as const,
-              key: runId,
-              properties: {
-                "Run ID": Builder.title(runId),
-                Status: Builder.select("Success"),
-                "Executed At": Builder.richText(executedAt),
-                Summary: Builder.richText(JSON.stringify(summary)),
-              },
-            },
-          ],
-          hasMore: false,
-        };
-      } catch (error) {
-        const message =
-          error instanceof Error
-            ? error.message
-            : "Unknown ten-symbol batch error.";
-
-        return {
-          changes: [
-            {
-              type: "upsert" as const,
-              key: runId,
-              properties: {
-                "Run ID": Builder.title(runId),
-                Status: Builder.select("Failed"),
-                "Executed At": Builder.richText(executedAt),
-                Summary: Builder.richText(
-                  JSON.stringify({
-                    message,
-                    writesPerformed,
-                  }),
-                ),
-              },
-            },
-          ],
-          hasMore: false,
-        };
-      }
-    },
-  });
-}
-
-registerNonOwnedBatchCapability(
-  "tenSymbolUpdateDryRun",
-  TEN_SYMBOL_TEST,
-  false,
-);
-
-registerNonOwnedBatchCapability(
-  "tenSymbolControlledUpdate",
-  TEN_SYMBOL_TEST,
-  true,
-);
 
 const scalableFinnhubPacer = worker.pacer("scalableFinnhubPacer", {
   allowedRequests: 1,
@@ -932,12 +72,441 @@ type StockTrackerRefreshState = {
   rowsUpdated: number;
   rowsSkipped: number;
   failureCount: number;
+  finnhubRetries: number;
+  notionRetries: number;
   failureSamples: Array<{
     symbol: string;
     reason: string;
   }>;
   symbolCounts: Record<string, number>;
 };
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+}
+
+function parseRetryAfterMs(value: string | null | undefined):
+  | number
+  | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const seconds = Number(value);
+
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return seconds * 1000;
+  }
+
+  const retryAt = Date.parse(value);
+
+  if (Number.isFinite(retryAt)) {
+    return Math.max(0, retryAt - Date.now());
+  }
+
+  return undefined;
+}
+
+function readHeader(
+  container: unknown,
+  headerName: string,
+): string | undefined {
+  if (
+    typeof container !== "object" ||
+    container === null
+  ) {
+    return undefined;
+  }
+
+  const possibleHeaders = container as {
+    get?: (name: string) => string | null;
+    [key: string]: unknown;
+  };
+
+  if (typeof possibleHeaders.get === "function") {
+    const value = possibleHeaders.get.call(
+      container,
+      headerName,
+    );
+
+    return value ?? undefined;
+  }
+
+  const targetName = headerName.toLowerCase();
+
+  for (const [key, value] of Object.entries(possibleHeaders)) {
+    if (
+      key.toLowerCase() === targetName &&
+      typeof value === "string"
+    ) {
+      return value;
+    }
+  }
+
+  return undefined;
+}
+
+function getErrorStatus(error: unknown): number | undefined {
+  if (
+    typeof error !== "object" ||
+    error === null
+  ) {
+    return undefined;
+  }
+
+  const candidate = error as {
+    status?: unknown;
+    statusCode?: unknown;
+    code?: unknown;
+    response?: {
+      status?: unknown;
+    };
+  };
+
+  if (typeof candidate.status === "number") {
+    return candidate.status;
+  }
+
+  if (typeof candidate.statusCode === "number") {
+    return candidate.statusCode;
+  }
+
+  if (typeof candidate.response?.status === "number") {
+    return candidate.response.status;
+  }
+
+  if (candidate.code === "rate_limited") {
+    return 429;
+  }
+
+  return undefined;
+}
+
+function getErrorRetryAfterMs(
+  error: unknown,
+): number | undefined {
+  if (
+    typeof error !== "object" ||
+    error === null
+  ) {
+    return undefined;
+  }
+
+  const candidate = error as {
+    headers?: unknown;
+    response?: {
+      headers?: unknown;
+    };
+  };
+
+  const retryAfter =
+    readHeader(candidate.headers, "Retry-After") ??
+    readHeader(
+      candidate.response?.headers,
+      "Retry-After",
+    );
+
+  return parseRetryAfterMs(retryAfter);
+}
+
+function isRetryableStatus(status: number): boolean {
+  return (
+    status === 408 ||
+    status === 409 ||
+    status === 425 ||
+    status === 429 ||
+    status >= 500
+  );
+}
+
+function getErrorMessage(
+  error: unknown,
+  fallback: string,
+): string {
+  return error instanceof Error
+    ? error.message
+    : fallback;
+}
+
+async function withNotionRetry<T>(
+  operation: () => Promise<T>,
+  operationName: string,
+  onRetry?: RetryCallback,
+): Promise<T> {
+  for (
+    let attempt = 1;
+    attempt <= NOTION_MAX_ATTEMPTS;
+    attempt += 1
+  ) {
+    try {
+      return await operation();
+    } catch (error) {
+      const status = getErrorStatus(error);
+      const retryable =
+        status === undefined || isRetryableStatus(status);
+
+      if (
+        !retryable ||
+        attempt === NOTION_MAX_ATTEMPTS
+      ) {
+        const reason = getErrorMessage(
+          error,
+          "Unknown Notion API error.",
+        );
+
+        throw new Error(
+          `${operationName} failed after ${attempt} attempt(s): ${reason}`,
+        );
+      }
+
+      const retryAfterMs =
+        getErrorRetryAfterMs(error);
+
+      const delayMs =
+        retryAfterMs ??
+        1000 * 2 ** (attempt - 1);
+
+      if (delayMs > MAX_RETRY_DELAY_MS) {
+        throw new Error(
+          `${operationName} requested a retry delay of ${delayMs}ms, which exceeds the safe retry window.`,
+        );
+      }
+
+      onRetry?.({
+        service: "Notion",
+        attempt,
+        delayMs,
+        status,
+      });
+
+      await sleep(delayMs);
+    }
+  }
+
+  throw new Error(
+    `${operationName} ended unexpectedly.`,
+  );
+}
+
+async function fetchFinnhubQuote(
+  symbol: string,
+  onRetry?: RetryCallback,
+): Promise<Quote> {
+  const apiKey = process.env.FINNHUB_API_KEY;
+
+  if (!apiKey) {
+    throw new Error(
+      "FINNHUB_API_KEY is not configured.",
+    );
+  }
+
+  const url = new URL(
+    "https://finnhub.io/api/v1/quote",
+  );
+
+  url.searchParams.set("symbol", symbol);
+
+  for (
+    let attempt = 1;
+    attempt <= FINNHUB_MAX_ATTEMPTS;
+    attempt += 1
+  ) {
+    let response: Response;
+
+    try {
+      response = await fetch(url.toString(), {
+        headers: {
+          "X-Finnhub-Token": apiKey,
+        },
+      });
+    } catch (error) {
+      if (attempt === FINNHUB_MAX_ATTEMPTS) {
+        const reason = getErrorMessage(
+          error,
+          "Unknown Finnhub network error.",
+        );
+
+        throw new Error(
+          `Finnhub request for ${symbol} failed after ${attempt} attempts: ${reason}`,
+        );
+      }
+
+      const delayMs =
+        2000 * 2 ** (attempt - 1);
+
+      onRetry?.({
+        service: "Finnhub",
+        attempt,
+        delayMs,
+      });
+
+      await sleep(delayMs);
+      continue;
+    }
+
+    if (!response.ok) {
+      const retryable =
+        isRetryableStatus(response.status);
+
+      if (
+        !retryable ||
+        attempt === FINNHUB_MAX_ATTEMPTS
+      ) {
+        throw new Error(
+          `Finnhub request for ${symbol} failed with HTTP ${response.status} after ${attempt} attempt(s).`,
+        );
+      }
+
+      const retryAfterMs = parseRetryAfterMs(
+        response.headers.get("Retry-After"),
+      );
+
+      const delayMs =
+        retryAfterMs ??
+        2000 * 2 ** (attempt - 1);
+
+      if (delayMs > MAX_RETRY_DELAY_MS) {
+        throw new Error(
+          `Finnhub returned HTTP ${response.status} for ${symbol}, but its Retry-After delay of ${delayMs}ms exceeds the safe retry window.`,
+        );
+      }
+
+      onRetry?.({
+        service: "Finnhub",
+        attempt,
+        delayMs,
+        status: response.status,
+      });
+
+      await sleep(delayMs);
+      continue;
+    }
+
+    let raw: Partial<FinnhubQuoteResponse>;
+
+    try {
+      raw =
+        (await response.json()) as Partial<FinnhubQuoteResponse>;
+    } catch (error) {
+      if (attempt === FINNHUB_MAX_ATTEMPTS) {
+        const reason = getErrorMessage(
+          error,
+          "Invalid JSON response.",
+        );
+
+        throw new Error(
+          `Finnhub returned an unreadable response for ${symbol} after ${attempt} attempt(s): ${reason}`,
+        );
+      }
+
+      const delayMs =
+        2000 * 2 ** (attempt - 1);
+
+      onRetry?.({
+        service: "Finnhub",
+        attempt,
+        delayMs,
+        status: response.status,
+      });
+
+      await sleep(delayMs);
+      continue;
+    }
+
+    if (
+      typeof raw.c !== "number" ||
+      typeof raw.dp !== "number" ||
+      typeof raw.t !== "number" ||
+      !Number.isFinite(raw.c) ||
+      !Number.isFinite(raw.dp) ||
+      !Number.isFinite(raw.t) ||
+      raw.c <= 0 ||
+      raw.t <= 0
+    ) {
+      throw new Error(
+        `Finnhub returned an invalid quote for ${symbol}.`,
+      );
+    }
+
+    return {
+      symbol,
+      marketPrice: raw.c,
+      dayChangeDecimal: raw.dp / 100,
+      quotedAt: new Date(
+        raw.t * 1000,
+      ).toISOString(),
+    };
+  }
+
+  throw new Error(
+    `Finnhub request for ${symbol} ended unexpectedly.`,
+  );
+}
+
+function extractSymbol(page: unknown): string {
+  const properties = (
+    page as {
+      properties?: Record<string, unknown>;
+    }
+  ).properties;
+
+  const symbolProperty = properties?.Symbol as
+    | {
+        type?: string;
+        title?: Array<{
+          plain_text?: string;
+        }>;
+      }
+    | undefined;
+
+  if (
+    symbolProperty?.type !== "title" ||
+    !Array.isArray(symbolProperty.title)
+  ) {
+    return "";
+  }
+
+  return symbolProperty.title
+    .map((item) => item.plain_text ?? "")
+    .join("")
+    .trim()
+    .toUpperCase();
+}
+
+function toChicagoDate(
+  isoTimestamp: string,
+): string {
+  const parts = new Intl.DateTimeFormat(
+    "en-US",
+    {
+      timeZone: "America/Chicago",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    },
+  ).formatToParts(new Date(isoTimestamp));
+
+  const values = Object.fromEntries(
+    parts.map((part) => [
+      part.type,
+      part.value,
+    ]),
+  );
+
+  if (
+    !values.year ||
+    !values.month ||
+    !values.day
+  ) {
+    throw new Error(
+      "Could not convert quote timestamp to a Chicago date.",
+    );
+  }
+
+  return `${values.year}-${values.month}-${values.day}`;
+}
 
 function registerScalableStockTrackerCapability(
   capabilityKey: string,
@@ -947,31 +516,66 @@ function registerScalableStockTrackerCapability(
     database: stockRefreshRuns,
     mode: "incremental",
     schedule: "manual",
-    execute: async (rawState, { notion }) => {
-      const previous = rawState as StockTrackerRefreshState | undefined;
-      const mode = performWrite ? "write" : "dry-run";
-      const startedAt = previous?.startedAt ?? new Date().toISOString();
 
-      const progress: StockTrackerRefreshState = previous
-        ? {
-            ...previous,
-            failureSamples: [...previous.failureSamples],
-            symbolCounts: { ...previous.symbolCounts },
-          }
-        : {
-            runId: `tracker-paginated-${mode}-${startedAt}`,
-            startedAt,
-            batchNumber: 0,
-            rowsDiscovered: 0,
-            quotesRequested: 0,
-            quotesReceived: 0,
-            rowsPlanned: 0,
-            rowsUpdated: 0,
-            rowsSkipped: 0,
-            failureCount: 0,
-            failureSamples: [],
-            symbolCounts: {},
-          };
+    execute: async (
+      rawState,
+      { notion },
+    ) => {
+      const previous =
+        rawState as
+          | StockTrackerRefreshState
+          | undefined;
+
+      const mode = performWrite
+        ? "write"
+        : "dry-run";
+
+      const startedAt =
+        previous?.startedAt ??
+        new Date().toISOString();
+
+      const progress: StockTrackerRefreshState =
+        previous
+          ? {
+              ...previous,
+              finnhubRetries:
+                previous.finnhubRetries ?? 0,
+              notionRetries:
+                previous.notionRetries ?? 0,
+              failureSamples: [
+                ...previous.failureSamples,
+              ],
+              symbolCounts: {
+                ...previous.symbolCounts,
+              },
+            }
+          : {
+              runId:
+                `tracker-paginated-${mode}-${startedAt}`,
+              startedAt,
+              batchNumber: 0,
+              rowsDiscovered: 0,
+              quotesRequested: 0,
+              quotesReceived: 0,
+              rowsPlanned: 0,
+              rowsUpdated: 0,
+              rowsSkipped: 0,
+              failureCount: 0,
+              finnhubRetries: 0,
+              notionRetries: 0,
+              failureSamples: [],
+              symbolCounts: {},
+            };
+
+      const recordRetry: RetryCallback = (
+        details,
+      ) => {
+        if (details.service === "Finnhub") {
+          progress.finnhubRetries += 1;
+        } else {
+          progress.notionRetries += 1;
+        }
+      };
 
       const recordFailure = (
         symbol: string,
@@ -981,7 +585,9 @@ function registerScalableStockTrackerCapability(
         progress.failureCount += 1;
         progress.rowsSkipped += skippedRows;
 
-        if (progress.failureSamples.length < 25) {
+        if (
+          progress.failureSamples.length < 25
+        ) {
           progress.failureSamples.push({
             symbol,
             reason,
@@ -993,39 +599,63 @@ function registerScalableStockTrackerCapability(
         hasMore: boolean,
         batchRows: number,
       ) => {
-        const duplicateSymbols = Object.entries(
-          progress.symbolCounts,
-        )
-          .filter(([, count]) => count > 1)
-          .map(([symbol, count]) => ({
-            symbol,
-            count,
-          }));
+        const duplicateSymbols =
+          Object.entries(
+            progress.symbolCounts,
+          )
+            .filter(
+              ([, count]) => count > 1,
+            )
+            .map(([symbol, count]) => ({
+              symbol,
+              count,
+            }));
 
         return {
-          test: "Paginated full Stock Tracker refresh",
+          test:
+            "Paginated full Stock Tracker refresh",
           mode,
-          batchNumber: progress.batchNumber,
+          batchNumber:
+            progress.batchNumber,
           batchRows,
           hasMore,
           cumulative: {
-            rowsDiscovered: progress.rowsDiscovered,
-            uniqueSymbols: Object.keys(progress.symbolCounts).length,
-            quotesRequested: progress.quotesRequested,
-            quotesReceived: progress.quotesReceived,
-            rowsPlanned: progress.rowsPlanned,
-            rowsUpdated: progress.rowsUpdated,
-            rowsSkipped: progress.rowsSkipped,
-            failureCount: progress.failureCount,
+            rowsDiscovered:
+              progress.rowsDiscovered,
+            uniqueSymbols:
+              Object.keys(
+                progress.symbolCounts,
+              ).length,
+            quotesRequested:
+              progress.quotesRequested,
+            quotesReceived:
+              progress.quotesReceived,
+            rowsPlanned:
+              progress.rowsPlanned,
+            rowsUpdated:
+              progress.rowsUpdated,
+            rowsSkipped:
+              progress.rowsSkipped,
+            failureCount:
+              progress.failureCount,
+            finnhubRetries:
+              progress.finnhubRetries,
+            notionRetries:
+              progress.notionRetries,
           },
           duplicateSymbols,
-          failureSamples: progress.failureSamples,
+          failureSamples:
+            progress.failureSamples,
           propertiesTargeted: [
             "Market Price",
             "Day Change %",
             "Snapshot Date",
           ],
-          runtimeMs: Date.now() - Date.parse(progress.startedAt),
+          runtimeMs:
+            Date.now() -
+            Date.parse(
+              progress.startedAt,
+            ),
         };
       };
 
@@ -1036,157 +666,258 @@ function registerScalableStockTrackerCapability(
         type: "upsert" as const,
         key: progress.runId,
         properties: {
-          "Run ID": Builder.title(progress.runId),
+          "Run ID": Builder.title(
+            progress.runId,
+          ),
           Status: Builder.select(status),
-          "Executed At": Builder.richText(progress.startedAt),
-          Summary: Builder.richText(JSON.stringify(summary)),
+          "Executed At":
+            Builder.richText(
+              progress.startedAt,
+            ),
+          Summary: Builder.richText(
+            JSON.stringify(summary),
+          ),
         },
       });
 
       try {
-        const searchResponse = await notion.search({
-          filter: {
-            property: "object",
-            value: "data_source",
-          },
-          page_size: 10,
-        });
+        const searchResponse =
+          await withNotionRetry(
+            () =>
+              notion.search({
+                filter: {
+                  property: "object",
+                  value: "data_source",
+                },
+                page_size: 10,
+              }),
+            "Notion data-source search",
+            recordRetry,
+          );
 
-        if (searchResponse.results.length !== 1) {
+        if (
+          searchResponse.results.length !== 1
+        ) {
           throw new Error(
             `Expected exactly one accessible data source; found ${searchResponse.results.length}.`,
           );
         }
 
-        const dataSourceId = searchResponse.results[0].id;
+        const dataSourceId =
+          searchResponse.results[0].id;
 
-        const response = await notion.dataSources.query({
-          data_source_id: dataSourceId,
-          page_size: 15,
-          start_cursor: progress.cursor,
-        });
+        const response =
+          await withNotionRetry(
+            () =>
+              notion.dataSources.query({
+                data_source_id:
+                  dataSourceId,
+                page_size: 15,
+                start_cursor:
+                  progress.cursor,
+              }),
+            "Stock Tracker batch query",
+            recordRetry,
+          );
 
         progress.batchNumber += 1;
 
-        const groupedRows = new Map<string, string[]>();
+        const groupedRows =
+          new Map<string, string[]>();
 
-        for (const result of response.results) {
+        for (
+          const result of response.results
+        ) {
           const page = result as {
             id: string;
-            properties: Record<string, unknown>;
+            properties: Record<
+              string,
+              unknown
+            >;
           };
 
           progress.rowsDiscovered += 1;
 
-          const symbol = extractSymbol(page);
+          const symbol =
+            extractSymbol(page);
 
           if (!symbol) {
             recordFailure(
               "(blank)",
-              `Owned row ${page.id} has a blank or invalid Symbol.`,
+              `Stock Tracker row ${page.id} has a blank or invalid Symbol.`,
               1,
             );
+
             continue;
           }
 
           progress.symbolCounts[symbol] =
-            (progress.symbolCounts[symbol] ?? 0) + 1;
+            (progress.symbolCounts[
+              symbol
+            ] ?? 0) + 1;
 
-          const pageIds = groupedRows.get(symbol) ?? [];
+          const pageIds =
+            groupedRows.get(symbol) ?? [];
+
           pageIds.push(page.id);
-          groupedRows.set(symbol, pageIds);
+          groupedRows.set(
+            symbol,
+            pageIds,
+          );
         }
 
-        for (const [symbol, pageIds] of groupedRows.entries()) {
+        for (
+          const [
+            symbol,
+            pageIds,
+          ] of groupedRows.entries()
+        ) {
           progress.quotesRequested += 1;
 
           try {
             await scalableFinnhubPacer.wait();
 
-            const quote = await fetchFinnhubQuote(symbol);
+            const quote =
+              await fetchFinnhubQuote(
+                symbol,
+                recordRetry,
+              );
+
             progress.quotesReceived += 1;
-            progress.rowsPlanned += pageIds.length;
+            progress.rowsPlanned +=
+              pageIds.length;
 
             if (!performWrite) {
               continue;
             }
 
-            const snapshotDate = toChicagoDate(quote.quotedAt);
+            const snapshotDate =
+              toChicagoDate(
+                quote.quotedAt,
+              );
 
-            for (const pageId of pageIds) {
+            for (
+              const pageId of pageIds
+            ) {
               try {
                 await scalableNotionWritePacer.wait();
 
-                await notion.pages.update({
-                  page_id: pageId,
-                  properties: {
-                    "Market Price": {
-                      number: quote.marketPrice,
-                    },
-                    "Day Change %": {
-                      number: quote.dayChangeDecimal,
-                    },
-                    "Snapshot Date": {
-                      date: {
-                        start: snapshotDate,
+                await withNotionRetry(
+                  () =>
+                    notion.pages.update({
+                      page_id: pageId,
+                      properties: {
+                        "Market Price": {
+                          number:
+                            quote.marketPrice,
+                        },
+                        "Day Change %": {
+                          number:
+                            quote.dayChangeDecimal,
+                        },
+                        "Snapshot Date": {
+                          date: {
+                            start:
+                              snapshotDate,
+                          },
+                        },
                       },
-                    },
-                  },
-                });
+                    }),
+                  `Notion update for ${symbol}`,
+                  recordRetry,
+                );
 
                 progress.rowsUpdated += 1;
               } catch (error) {
                 const reason =
-                  error instanceof Error
-                    ? error.message
-                    : "Unknown Notion update error.";
+                  getErrorMessage(
+                    error,
+                    "Unknown Notion update error.",
+                  );
 
-                recordFailure(symbol, reason, 1);
+                recordFailure(
+                  symbol,
+                  reason,
+                  1,
+                );
               }
             }
           } catch (error) {
             const reason =
-              error instanceof Error
-                ? error.message
-                : "Unknown Finnhub quote error.";
+              getErrorMessage(
+                error,
+                "Unknown Finnhub quote error.",
+              );
 
-            recordFailure(symbol, reason, pageIds.length);
+            /*
+             * No write occurs for this symbol when
+             * the quote fails. Existing valid values
+             * therefore remain unchanged.
+             */
+            recordFailure(
+              symbol,
+              reason,
+              pageIds.length,
+            );
           }
         }
 
         const hasMore =
-          response.has_more && response.next_cursor !== null;
+          response.has_more &&
+          response.next_cursor !== null;
 
-        const summary = buildSummary(
-          hasMore,
-          response.results.length,
-        );
+        const summary =
+          buildSummary(
+            hasMore,
+            response.results.length,
+          );
 
         const status =
-          progress.failureCount > 0 ? "Failed" : "Success";
+          progress.failureCount > 0
+            ? "Failed"
+            : "Success";
 
-        if (hasMore && response.next_cursor) {
+        if (
+          hasMore &&
+          response.next_cursor
+        ) {
           return {
-            changes: [buildRunChange(status, summary)],
+            changes: [
+              buildRunChange(
+                status,
+                summary,
+              ),
+            ],
             hasMore: true,
             nextState: {
               ...progress,
-              cursor: response.next_cursor,
+              cursor:
+                response.next_cursor,
             },
           };
         }
 
         return {
-          changes: [buildRunChange(status, summary)],
+          changes: [
+            buildRunChange(
+              status,
+              summary,
+            ),
+          ],
           hasMore: false,
         };
       } catch (error) {
         const reason =
-          error instanceof Error
-            ? error.message
-            : "Unknown paginated refresh error.";
+          getErrorMessage(
+            error,
+            "Unknown paginated refresh error.",
+          );
 
-        recordFailure("(batch)", reason, 0);
+        recordFailure(
+          "(batch)",
+          reason,
+          0,
+        );
 
         return {
           changes: [
@@ -1211,4 +942,3 @@ registerScalableStockTrackerCapability(
   "stockTrackerFullRefresh",
   true,
 );
-
