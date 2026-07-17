@@ -920,7 +920,7 @@ const scalableNotionWritePacer = worker.pacer(
   },
 );
 
-type OwnedRefreshState = {
+type StockTrackerRefreshState = {
   cursor?: string;
   runId: string;
   startedAt: string;
@@ -939,7 +939,7 @@ type OwnedRefreshState = {
   symbolCounts: Record<string, number>;
 };
 
-function registerScalableOwnedPositionCapability(
+function registerScalableStockTrackerCapability(
   capabilityKey: string,
   performWrite: boolean,
 ) {
@@ -948,18 +948,18 @@ function registerScalableOwnedPositionCapability(
     mode: "incremental",
     schedule: "manual",
     execute: async (rawState, { notion }) => {
-      const previous = rawState as OwnedRefreshState | undefined;
+      const previous = rawState as StockTrackerRefreshState | undefined;
       const mode = performWrite ? "write" : "dry-run";
       const startedAt = previous?.startedAt ?? new Date().toISOString();
 
-      const progress: OwnedRefreshState = previous
+      const progress: StockTrackerRefreshState = previous
         ? {
             ...previous,
             failureSamples: [...previous.failureSamples],
             symbolCounts: { ...previous.symbolCounts },
           }
         : {
-            runId: `owned-paginated-${mode}-${startedAt}`,
+            runId: `tracker-paginated-${mode}-${startedAt}`,
             startedAt,
             batchNumber: 0,
             rowsDiscovered: 0,
@@ -1003,7 +1003,7 @@ function registerScalableOwnedPositionCapability(
           }));
 
         return {
-          test: "Paginated owned-position refresh",
+          test: "Paginated full Stock Tracker refresh",
           mode,
           batchNumber: progress.batchNumber,
           batchRows,
@@ -1062,12 +1062,6 @@ function registerScalableOwnedPositionCapability(
 
         const response = await notion.dataSources.query({
           data_source_id: dataSourceId,
-          filter: {
-            property: "Owned",
-            checkbox: {
-              equals: true,
-            },
-          },
           page_size: 15,
           start_cursor: progress.cursor,
         });
@@ -1208,12 +1202,13 @@ function registerScalableOwnedPositionCapability(
   });
 }
 
-registerScalableOwnedPositionCapability(
-  "ownedPositionsDryRun",
+registerScalableStockTrackerCapability(
+  "stockTrackerFullDryRun",
   false,
 );
 
-registerScalableOwnedPositionCapability(
-  "ownedPositionsControlledUpdate",
+registerScalableStockTrackerCapability(
+  "stockTrackerFullRefresh",
   true,
 );
+
