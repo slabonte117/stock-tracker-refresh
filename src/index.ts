@@ -706,3 +706,203 @@ function registerTwoSymbolUpdateCapability(
 
 registerTwoSymbolUpdateCapability("twoSymbolUpdateDryRun", false);
 registerTwoSymbolUpdateCapability("twoSymbolControlledUpdate", true);
+
+const TEN_SYMBOL_TEST = [
+  "AAPL",
+  "TSLA",
+  "ROKT",
+  "UFO",
+  "ARKX",
+  "FITE",
+  "PPA",
+  "ITA",
+  "XAR",
+  "BOTZ",
+] as const;
+
+function registerNonOwnedBatchCapability(
+  capabilityKey: string,
+  symbols: readonly string[],
+  performWrite: boolean,
+) {
+  worker.sync(capabilityKey, {
+    database: stockRefreshRuns,
+    mode: "incremental",
+    schedule: "manual",
+    execute: async (_state, { notion }) => {
+      const executedAt = new Date().toISOString();
+      const mode = performWrite ? "write" : "dry-run";
+      const runId = `non-owned-${symbols.length}-${mode}-${executedAt}`;
+      let writesPerformed = 0;
+
+      try {
+        const searchResponse = await notion.search({
+          filter: {
+            property: "object",
+            value: "data_source",
+          },
+          page_size: 10,
+        });
+
+        if (searchResponse.results.length !== 1) {
+          throw new Error(
+            `Expected exactly one accessible data source; found ${searchResponse.results.length}.`,
+          );
+        }
+
+        const dataSourceId = searchResponse.results[0].id;
+        const plans: Array<{
+          symbol: string;
+          pageId: string;
+          marketPrice: number;
+          dayChangeDecimal: number;
+          snapshotDate: string;
+        }> = [];
+
+        for (const symbol of symbols) {
+          const queryResponse = await notion.dataSources.query({
+            data_source_id: dataSourceId,
+            filter: {
+              property: "Symbol",
+              title: {
+                equals: symbol,
+              },
+            },
+            page_size: 10,
+          });
+
+          if (queryResponse.results.length !== 1) {
+            throw new Error(
+              `Expected exactly one ${symbol} row; found ${queryResponse.results.length}.`,
+            );
+          }
+
+          const page = queryResponse.results[0] as {
+            id: string;
+            properties: Record<string, unknown>;
+          };
+
+          const owned =
+            (
+              page.properties.Owned as
+                | { type?: string; checkbox?: boolean }
+                | undefined
+            )?.checkbox ?? null;
+
+          if (owned !== false) {
+            throw new Error(
+              `${symbol} is not confirmed as non-owned. Batch blocked.`,
+            );
+          }
+
+          const quote = await fetchFinnhubQuote(symbol);
+
+          plans.push({
+            symbol,
+            pageId: page.id,
+            marketPrice: quote.marketPrice,
+            dayChangeDecimal: quote.dayChangeDecimal,
+            snapshotDate: toChicagoDate(quote.quotedAt),
+          });
+        }
+
+        if (performWrite) {
+          for (const plan of plans) {
+            await notion.pages.update({
+              page_id: plan.pageId,
+              properties: {
+                "Market Price": {
+                  number: plan.marketPrice,
+                },
+                "Day Change %": {
+                  number: plan.dayChangeDecimal,
+                },
+                "Snapshot Date": {
+                  date: {
+                    start: plan.snapshotDate,
+                  },
+                },
+              },
+            });
+
+            writesPerformed += 1;
+          }
+        }
+
+        const summary = {
+          test: "Ten-symbol non-owned batch",
+          mode,
+          symbolsRequested: symbols.length,
+          quotesReceived: plans.length,
+          allRowsConfirmedNonOwned: true,
+          plans: plans.map((plan) => ({
+            symbol: plan.symbol,
+            marketPrice: plan.marketPrice,
+            dayChangeDecimal: plan.dayChangeDecimal,
+            snapshotDate: plan.snapshotDate,
+          })),
+          propertiesTargeted: [
+            "Market Price",
+            "Day Change %",
+            "Snapshot Date",
+          ],
+          writesPerformed,
+        };
+
+        return {
+          changes: [
+            {
+              type: "upsert" as const,
+              key: runId,
+              properties: {
+                "Run ID": Builder.title(runId),
+                Status: Builder.select("Success"),
+                "Executed At": Builder.richText(executedAt),
+                Summary: Builder.richText(JSON.stringify(summary)),
+              },
+            },
+          ],
+          hasMore: false,
+        };
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Unknown ten-symbol batch error.";
+
+        return {
+          changes: [
+            {
+              type: "upsert" as const,
+              key: runId,
+              properties: {
+                "Run ID": Builder.title(runId),
+                Status: Builder.select("Failed"),
+                "Executed At": Builder.richText(executedAt),
+                Summary: Builder.richText(
+                  JSON.stringify({
+                    message,
+                    writesPerformed,
+                  }),
+                ),
+              },
+            },
+          ],
+          hasMore: false,
+        };
+      }
+    },
+  });
+}
+
+registerNonOwnedBatchCapability(
+  "tenSymbolUpdateDryRun",
+  TEN_SYMBOL_TEST,
+  false,
+);
+
+registerNonOwnedBatchCapability(
+  "tenSymbolControlledUpdate",
+  TEN_SYMBOL_TEST,
+  true,
+);
