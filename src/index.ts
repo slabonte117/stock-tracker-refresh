@@ -25,6 +25,27 @@ type RetryCallback = (details: {
   status?: number;
 }) => void;
 
+type StockTrackerRefreshState = {
+  cursor?: string;
+  runId: string;
+  startedAt: string;
+  batchNumber: number;
+  rowsDiscovered: number;
+  quotesRequested: number;
+  quotesReceived: number;
+  rowsPlanned: number;
+  rowsUpdated: number;
+  rowsSkipped: number;
+  failureCount: number;
+  finnhubRetries: number;
+  notionRetries: number;
+  failureSamples: Array<{
+    symbol: string;
+    reason: string;
+  }>;
+  symbolCounts: Record<string, number>;
+};
+
 const FINNHUB_MAX_ATTEMPTS = 3;
 const NOTION_MAX_ATTEMPTS = 3;
 const MAX_RETRY_DELAY_MS = 10_000;
@@ -60,36 +81,15 @@ const scalableNotionWritePacer = worker.pacer(
   },
 );
 
-type StockTrackerRefreshState = {
-  cursor?: string;
-  runId: string;
-  startedAt: string;
-  batchNumber: number;
-  rowsDiscovered: number;
-  quotesRequested: number;
-  quotesReceived: number;
-  rowsPlanned: number;
-  rowsUpdated: number;
-  rowsSkipped: number;
-  failureCount: number;
-  finnhubRetries: number;
-  notionRetries: number;
-  failureSamples: Array<{
-    symbol: string;
-    reason: string;
-  }>;
-  symbolCounts: Record<string, number>;
-};
-
 function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, milliseconds);
   });
 }
 
-function parseRetryAfterMs(value: string | null | undefined):
-  | number
-  | undefined {
+function parseRetryAfterMs(
+  value: string | null | undefined,
+): number | undefined {
   if (!value) {
     return undefined;
   }
@@ -113,10 +113,7 @@ function readHeader(
   container: unknown,
   headerName: string,
 ): string | undefined {
-  if (
-    typeof container !== "object" ||
-    container === null
-  ) {
+  if (typeof container !== "object" || container === null) {
     return undefined;
   }
 
@@ -126,21 +123,13 @@ function readHeader(
   };
 
   if (typeof possibleHeaders.get === "function") {
-    const value = possibleHeaders.get.call(
-      container,
-      headerName,
-    );
-
-    return value ?? undefined;
+    return possibleHeaders.get.call(container, headerName) ?? undefined;
   }
 
   const targetName = headerName.toLowerCase();
 
   for (const [key, value] of Object.entries(possibleHeaders)) {
-    if (
-      key.toLowerCase() === targetName &&
-      typeof value === "string"
-    ) {
+    if (key.toLowerCase() === targetName && typeof value === "string") {
       return value;
     }
   }
@@ -149,10 +138,7 @@ function readHeader(
 }
 
 function getErrorStatus(error: unknown): number | undefined {
-  if (
-    typeof error !== "object" ||
-    error === null
-  ) {
+  if (typeof error !== "object" || error === null) {
     return undefined;
   }
 
@@ -160,9 +146,7 @@ function getErrorStatus(error: unknown): number | undefined {
     status?: unknown;
     statusCode?: unknown;
     code?: unknown;
-    response?: {
-      status?: unknown;
-    };
+    response?: { status?: unknown };
   };
 
   if (typeof candidate.status === "number") {
@@ -184,31 +168,20 @@ function getErrorStatus(error: unknown): number | undefined {
   return undefined;
 }
 
-function getErrorRetryAfterMs(
-  error: unknown,
-): number | undefined {
-  if (
-    typeof error !== "object" ||
-    error === null
-  ) {
+function getErrorRetryAfterMs(error: unknown): number | undefined {
+  if (typeof error !== "object" || error === null) {
     return undefined;
   }
 
   const candidate = error as {
     headers?: unknown;
-    response?: {
-      headers?: unknown;
-    };
+    response?: { headers?: unknown };
   };
 
-  const retryAfter =
+  return parseRetryAfterMs(
     readHeader(candidate.headers, "Retry-After") ??
-    readHeader(
-      candidate.response?.headers,
-      "Retry-After",
-    );
-
-  return parseRetryAfterMs(retryAfter);
+      readHeader(candidate.response?.headers, "Retry-After"),
+  );
 }
 
 function isRetryableStatus(status: number): boolean {
@@ -221,13 +194,8 @@ function isRetryableStatus(status: number): boolean {
   );
 }
 
-function getErrorMessage(
-  error: unknown,
-  fallback: string,
-): string {
-  return error instanceof Error
-    ? error.message
-    : fallback;
+function getErrorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error ? error.message : fallback;
 }
 
 async function withNotionRetry<T>(
@@ -247,26 +215,17 @@ async function withNotionRetry<T>(
       const retryable =
         status === undefined || isRetryableStatus(status);
 
-      if (
-        !retryable ||
-        attempt === NOTION_MAX_ATTEMPTS
-      ) {
-        const reason = getErrorMessage(
-          error,
-          "Unknown Notion API error.",
-        );
-
+      if (!retryable || attempt === NOTION_MAX_ATTEMPTS) {
         throw new Error(
-          `${operationName} failed after ${attempt} attempt(s): ${reason}`,
+          `${operationName} failed after ${attempt} attempt(s): ${getErrorMessage(
+            error,
+            "Unknown Notion API error.",
+          )}`,
         );
       }
 
-      const retryAfterMs =
-        getErrorRetryAfterMs(error);
-
       const delayMs =
-        retryAfterMs ??
-        1000 * 2 ** (attempt - 1);
+        getErrorRetryAfterMs(error) ?? 1000 * 2 ** (attempt - 1);
 
       if (delayMs > MAX_RETRY_DELAY_MS) {
         throw new Error(
@@ -285,9 +244,7 @@ async function withNotionRetry<T>(
     }
   }
 
-  throw new Error(
-    `${operationName} ended unexpectedly.`,
-  );
+  throw new Error(`${operationName} ended unexpectedly.`);
 }
 
 async function fetchFinnhubQuote(
@@ -297,15 +254,10 @@ async function fetchFinnhubQuote(
   const apiKey = process.env.FINNHUB_API_KEY;
 
   if (!apiKey) {
-    throw new Error(
-      "FINNHUB_API_KEY is not configured.",
-    );
+    throw new Error("FINNHUB_API_KEY is not configured.");
   }
 
-  const url = new URL(
-    "https://finnhub.io/api/v1/quote",
-  );
-
+  const url = new URL("https://finnhub.io/api/v1/quote");
   url.searchParams.set("symbol", symbol);
 
   for (
@@ -323,18 +275,15 @@ async function fetchFinnhubQuote(
       });
     } catch (error) {
       if (attempt === FINNHUB_MAX_ATTEMPTS) {
-        const reason = getErrorMessage(
-          error,
-          "Unknown Finnhub network error.",
-        );
-
         throw new Error(
-          `Finnhub request for ${symbol} failed after ${attempt} attempts: ${reason}`,
+          `Finnhub request for ${symbol} failed after ${attempt} attempts: ${getErrorMessage(
+            error,
+            "Unknown Finnhub network error.",
+          )}`,
         );
       }
 
-      const delayMs =
-        2000 * 2 ** (attempt - 1);
+      const delayMs = 2000 * 2 ** (attempt - 1);
 
       onRetry?.({
         service: "Finnhub",
@@ -347,11 +296,8 @@ async function fetchFinnhubQuote(
     }
 
     if (!response.ok) {
-      const retryable =
-        isRetryableStatus(response.status);
-
       if (
-        !retryable ||
+        !isRetryableStatus(response.status) ||
         attempt === FINNHUB_MAX_ATTEMPTS
       ) {
         throw new Error(
@@ -359,12 +305,8 @@ async function fetchFinnhubQuote(
         );
       }
 
-      const retryAfterMs = parseRetryAfterMs(
-        response.headers.get("Retry-After"),
-      );
-
       const delayMs =
-        retryAfterMs ??
+        parseRetryAfterMs(response.headers.get("Retry-After")) ??
         2000 * 2 ** (attempt - 1);
 
       if (delayMs > MAX_RETRY_DELAY_MS) {
@@ -387,22 +329,18 @@ async function fetchFinnhubQuote(
     let raw: Partial<FinnhubQuoteResponse>;
 
     try {
-      raw =
-        (await response.json()) as Partial<FinnhubQuoteResponse>;
+      raw = (await response.json()) as Partial<FinnhubQuoteResponse>;
     } catch (error) {
       if (attempt === FINNHUB_MAX_ATTEMPTS) {
-        const reason = getErrorMessage(
-          error,
-          "Invalid JSON response.",
-        );
-
         throw new Error(
-          `Finnhub returned an unreadable response for ${symbol} after ${attempt} attempt(s): ${reason}`,
+          `Finnhub returned an unreadable response for ${symbol} after ${attempt} attempt(s): ${getErrorMessage(
+            error,
+            "Invalid JSON response.",
+          )}`,
         );
       }
 
-      const delayMs =
-        2000 * 2 ** (attempt - 1);
+      const delayMs = 2000 * 2 ** (attempt - 1);
 
       onRetry?.({
         service: "Finnhub",
@@ -425,24 +363,18 @@ async function fetchFinnhubQuote(
       raw.c <= 0 ||
       raw.t <= 0
     ) {
-      throw new Error(
-        `Finnhub returned an invalid quote for ${symbol}.`,
-      );
+      throw new Error(`Finnhub returned an invalid quote for ${symbol}.`);
     }
 
     return {
       symbol,
       marketPrice: raw.c,
       dayChangeDecimal: raw.dp / 100,
-      quotedAt: new Date(
-        raw.t * 1000,
-      ).toISOString(),
+      quotedAt: new Date(raw.t * 1000).toISOString(),
     };
   }
 
-  throw new Error(
-    `Finnhub request for ${symbol} ended unexpectedly.`,
-  );
+  throw new Error(`Finnhub request for ${symbol} ended unexpectedly.`);
 }
 
 function extractSymbol(page: unknown): string {
@@ -455,9 +387,7 @@ function extractSymbol(page: unknown): string {
   const symbolProperty = properties?.Symbol as
     | {
         type?: string;
-        title?: Array<{
-          plain_text?: string;
-        }>;
+        title?: Array<{ plain_text?: string }>;
       }
     | undefined;
 
@@ -475,101 +405,116 @@ function extractSymbol(page: unknown): string {
     .toUpperCase();
 }
 
-function toChicagoDate(
-  isoTimestamp: string,
-): string {
-  const parts = new Intl.DateTimeFormat(
-    "en-US",
-    {
-      timeZone: "America/Chicago",
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-    },
-  ).formatToParts(new Date(isoTimestamp));
+function toChicagoDate(isoTimestamp: string): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Chicago",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(isoTimestamp));
 
   const values = Object.fromEntries(
-    parts.map((part) => [
-      part.type,
-      part.value,
-    ]),
+    parts.map((part) => [part.type, part.value]),
   );
 
-  if (
-    !values.year ||
-    !values.month ||
-    !values.day
-  ) {
-    throw new Error(
-      "Could not convert quote timestamp to a Chicago date.",
-    );
+  if (!values.year || !values.month || !values.day) {
+    throw new Error("Could not convert quote timestamp to a Chicago date.");
   }
 
   return `${values.year}-${values.month}-${values.day}`;
 }
 
+/*
+ * Native sync schedules are interval-only. This function enforces the
+ * business-time rule in America/Chicago:
+ *
+ * - 10:00 through 10:04 a.m.
+ * - 3:10 through 3:14 p.m.
+ *
+ * A started multi-batch run continues regardless of the clock so it cannot
+ * be abandoned halfway through its 75-row refresh.
+ */
+function isScheduledRefreshWindow(now = new Date()): boolean {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Chicago",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(now);
+
+  const values = Object.fromEntries(
+    parts.map((part) => [part.type, part.value]),
+  );
+
+  const hour = Number(values.hour);
+  const minute = Number(values.minute);
+
+  const morningWindow = hour === 10 && minute >= 0 && minute <= 4;
+  const afternoonWindow = hour === 15 && minute >= 10 && minute <= 14;
+
+  return morningWindow || afternoonWindow;
+}
+
 function registerScalableStockTrackerCapability(
   capabilityKey: string,
   performWrite: boolean,
+  schedule: "manual" | "5m",
+  onlyRunInScheduledWindow = false,
 ) {
   worker.sync(capabilityKey, {
     database: stockRefreshRuns,
     mode: "incremental",
-    schedule: "manual",
+    schedule,
 
-    execute: async (
-      rawState,
-      { notion },
-    ) => {
-      const previous =
-        rawState as
-          | StockTrackerRefreshState
-          | undefined;
+    execute: async (rawState, { notion }) => {
+      const previous = rawState as StockTrackerRefreshState | undefined;
 
-      const mode = performWrite
-        ? "write"
-        : "dry-run";
+      /*
+       * A fresh scheduled check outside either target window exits without:
+       * - Finnhub calls
+       * - Stock Tracker reads or writes
+       * - a Stock Refresh Runs record
+       */
+      if (
+        onlyRunInScheduledWindow &&
+        !previous &&
+        !isScheduledRefreshWindow()
+      ) {
+        return {
+          changes: [],
+          hasMore: false,
+        };
+      }
 
-      const startedAt =
-        previous?.startedAt ??
-        new Date().toISOString();
+      const mode = performWrite ? "write" : "dry-run";
+      const startedAt = previous?.startedAt ?? new Date().toISOString();
 
-      const progress: StockTrackerRefreshState =
-        previous
-          ? {
-              ...previous,
-              finnhubRetries:
-                previous.finnhubRetries ?? 0,
-              notionRetries:
-                previous.notionRetries ?? 0,
-              failureSamples: [
-                ...previous.failureSamples,
-              ],
-              symbolCounts: {
-                ...previous.symbolCounts,
-              },
-            }
-          : {
-              runId:
-                `tracker-paginated-${mode}-${startedAt}`,
-              startedAt,
-              batchNumber: 0,
-              rowsDiscovered: 0,
-              quotesRequested: 0,
-              quotesReceived: 0,
-              rowsPlanned: 0,
-              rowsUpdated: 0,
-              rowsSkipped: 0,
-              failureCount: 0,
-              finnhubRetries: 0,
-              notionRetries: 0,
-              failureSamples: [],
-              symbolCounts: {},
-            };
+      const progress: StockTrackerRefreshState = previous
+        ? {
+            ...previous,
+            finnhubRetries: previous.finnhubRetries ?? 0,
+            notionRetries: previous.notionRetries ?? 0,
+            failureSamples: [...previous.failureSamples],
+            symbolCounts: { ...previous.symbolCounts },
+          }
+        : {
+            runId: `tracker-paginated-${mode}-${startedAt}`,
+            startedAt,
+            batchNumber: 0,
+            rowsDiscovered: 0,
+            quotesRequested: 0,
+            quotesReceived: 0,
+            rowsPlanned: 0,
+            rowsUpdated: 0,
+            rowsSkipped: 0,
+            failureCount: 0,
+            finnhubRetries: 0,
+            notionRetries: 0,
+            failureSamples: [],
+            symbolCounts: {},
+          };
 
-      const recordRetry: RetryCallback = (
-        details,
-      ) => {
+      const recordRetry: RetryCallback = (details) => {
         if (details.service === "Finnhub") {
           progress.finnhubRetries += 1;
         } else {
@@ -585,77 +530,45 @@ function registerScalableStockTrackerCapability(
         progress.failureCount += 1;
         progress.rowsSkipped += skippedRows;
 
-        if (
-          progress.failureSamples.length < 25
-        ) {
-          progress.failureSamples.push({
-            symbol,
-            reason,
-          });
+        if (progress.failureSamples.length < 25) {
+          progress.failureSamples.push({ symbol, reason });
         }
       };
 
-      const buildSummary = (
-        hasMore: boolean,
-        batchRows: number,
-      ) => {
-        const duplicateSymbols =
-          Object.entries(
-            progress.symbolCounts,
-          )
-            .filter(
-              ([, count]) => count > 1,
-            )
-            .map(([symbol, count]) => ({
-              symbol,
-              count,
-            }));
+      const buildSummary = (hasMore: boolean, batchRows: number) => {
+        const duplicateSymbols = Object.entries(progress.symbolCounts)
+          .filter(([, count]) => count > 1)
+          .map(([symbol, count]) => ({ symbol, count }));
 
         return {
-          test:
-            "Paginated full Stock Tracker refresh",
-          mode,
-          batchNumber:
-            progress.batchNumber,
+          test: "Paginated full Stock Tracker refresh",
+          mode: onlyRunInScheduledWindow ? "scheduled-write" : mode,
+          schedule: onlyRunInScheduledWindow
+            ? "America/Chicago 10:00 and 15:10"
+            : "manual",
+          batchNumber: progress.batchNumber,
           batchRows,
           hasMore,
           cumulative: {
-            rowsDiscovered:
-              progress.rowsDiscovered,
-            uniqueSymbols:
-              Object.keys(
-                progress.symbolCounts,
-              ).length,
-            quotesRequested:
-              progress.quotesRequested,
-            quotesReceived:
-              progress.quotesReceived,
-            rowsPlanned:
-              progress.rowsPlanned,
-            rowsUpdated:
-              progress.rowsUpdated,
-            rowsSkipped:
-              progress.rowsSkipped,
-            failureCount:
-              progress.failureCount,
-            finnhubRetries:
-              progress.finnhubRetries,
-            notionRetries:
-              progress.notionRetries,
+            rowsDiscovered: progress.rowsDiscovered,
+            uniqueSymbols: Object.keys(progress.symbolCounts).length,
+            quotesRequested: progress.quotesRequested,
+            quotesReceived: progress.quotesReceived,
+            rowsPlanned: progress.rowsPlanned,
+            rowsUpdated: progress.rowsUpdated,
+            rowsSkipped: progress.rowsSkipped,
+            failureCount: progress.failureCount,
+            finnhubRetries: progress.finnhubRetries,
+            notionRetries: progress.notionRetries,
           },
           duplicateSymbols,
-          failureSamples:
-            progress.failureSamples,
+          failureSamples: progress.failureSamples,
           propertiesTargeted: [
             "Market Price",
             "Day Change %",
             "Snapshot Date",
           ],
-          runtimeMs:
-            Date.now() -
-            Date.parse(
-              progress.startedAt,
-            ),
+          runtimeMs: Date.now() - Date.parse(progress.startedAt),
         };
       };
 
@@ -666,80 +579,57 @@ function registerScalableStockTrackerCapability(
         type: "upsert" as const,
         key: progress.runId,
         properties: {
-          "Run ID": Builder.title(
-            progress.runId,
-          ),
+          "Run ID": Builder.title(progress.runId),
           Status: Builder.select(status),
-          "Executed At":
-            Builder.richText(
-              progress.startedAt,
-            ),
-          Summary: Builder.richText(
-            JSON.stringify(summary),
-          ),
+          "Executed At": Builder.richText(progress.startedAt),
+          Summary: Builder.richText(JSON.stringify(summary)),
         },
       });
 
       try {
-        const searchResponse =
-          await withNotionRetry(
-            () =>
-              notion.search({
-                filter: {
-                  property: "object",
-                  value: "data_source",
-                },
-                page_size: 10,
-              }),
-            "Notion data-source search",
-            recordRetry,
-          );
+        const searchResponse = await withNotionRetry(
+          () =>
+            notion.search({
+              filter: {
+                property: "object",
+                value: "data_source",
+              },
+              page_size: 10,
+            }),
+          "Notion data-source search",
+          recordRetry,
+        );
 
-        if (
-          searchResponse.results.length !== 1
-        ) {
+        if (searchResponse.results.length !== 1) {
           throw new Error(
             `Expected exactly one accessible data source; found ${searchResponse.results.length}.`,
           );
         }
 
-        const dataSourceId =
-          searchResponse.results[0].id;
-
-        const response =
-          await withNotionRetry(
-            () =>
-              notion.dataSources.query({
-                data_source_id:
-                  dataSourceId,
-                page_size: 15,
-                start_cursor:
-                  progress.cursor,
-              }),
-            "Stock Tracker batch query",
-            recordRetry,
-          );
+        const response = await withNotionRetry(
+          () =>
+            notion.dataSources.query({
+              data_source_id: searchResponse.results[0].id,
+              page_size: 15,
+              start_cursor: progress.cursor,
+            }),
+          "Stock Tracker batch query",
+          recordRetry,
+        );
 
         progress.batchNumber += 1;
 
-        const groupedRows =
-          new Map<string, string[]>();
+        const groupedRows = new Map<string, string[]>();
 
-        for (
-          const result of response.results
-        ) {
+        for (const result of response.results) {
           const page = result as {
             id: string;
-            properties: Record<
-              string,
-              unknown
-            >;
+            properties: Record<string, unknown>;
           };
 
           progress.rowsDiscovered += 1;
 
-          const symbol =
-            extractSymbol(page);
+          const symbol = extractSymbol(page);
 
           if (!symbol) {
             recordFailure(
@@ -747,58 +637,35 @@ function registerScalableStockTrackerCapability(
               `Stock Tracker row ${page.id} has a blank or invalid Symbol.`,
               1,
             );
-
             continue;
           }
 
           progress.symbolCounts[symbol] =
-            (progress.symbolCounts[
-              symbol
-            ] ?? 0) + 1;
+            (progress.symbolCounts[symbol] ?? 0) + 1;
 
-          const pageIds =
-            groupedRows.get(symbol) ?? [];
-
+          const pageIds = groupedRows.get(symbol) ?? [];
           pageIds.push(page.id);
-          groupedRows.set(
-            symbol,
-            pageIds,
-          );
+          groupedRows.set(symbol, pageIds);
         }
 
-        for (
-          const [
-            symbol,
-            pageIds,
-          ] of groupedRows.entries()
-        ) {
+        for (const [symbol, pageIds] of groupedRows.entries()) {
           progress.quotesRequested += 1;
 
           try {
             await scalableFinnhubPacer.wait();
 
-            const quote =
-              await fetchFinnhubQuote(
-                symbol,
-                recordRetry,
-              );
+            const quote = await fetchFinnhubQuote(symbol, recordRetry);
 
             progress.quotesReceived += 1;
-            progress.rowsPlanned +=
-              pageIds.length;
+            progress.rowsPlanned += pageIds.length;
 
             if (!performWrite) {
               continue;
             }
 
-            const snapshotDate =
-              toChicagoDate(
-                quote.quotedAt,
-              );
+            const snapshotDate = toChicagoDate(quote.quotedAt);
 
-            for (
-              const pageId of pageIds
-            ) {
+            for (const pageId of pageIds) {
               try {
                 await scalableNotionWritePacer.wait();
 
@@ -808,17 +675,14 @@ function registerScalableStockTrackerCapability(
                       page_id: pageId,
                       properties: {
                         "Market Price": {
-                          number:
-                            quote.marketPrice,
+                          number: quote.marketPrice,
                         },
                         "Day Change %": {
-                          number:
-                            quote.dayChangeDecimal,
+                          number: quote.dayChangeDecimal,
                         },
                         "Snapshot Date": {
                           date: {
-                            start:
-                              snapshotDate,
+                            start: snapshotDate,
                           },
                         },
                       },
@@ -829,93 +693,55 @@ function registerScalableStockTrackerCapability(
 
                 progress.rowsUpdated += 1;
               } catch (error) {
-                const reason =
+                recordFailure(
+                  symbol,
                   getErrorMessage(
                     error,
                     "Unknown Notion update error.",
-                  );
-
-                recordFailure(
-                  symbol,
-                  reason,
+                  ),
                   1,
                 );
               }
             }
           } catch (error) {
-            const reason =
-              getErrorMessage(
-                error,
-                "Unknown Finnhub quote error.",
-              );
-
             /*
-             * No write occurs for this symbol when
-             * the quote fails. Existing valid values
-             * therefore remain unchanged.
+             * No write happens for this symbol after a quote failure.
+             * Existing market values remain intact.
              */
             recordFailure(
               symbol,
-              reason,
+              getErrorMessage(error, "Unknown Finnhub quote error."),
               pageIds.length,
             );
           }
         }
 
         const hasMore =
-          response.has_more &&
-          response.next_cursor !== null;
+          response.has_more && response.next_cursor !== null;
 
-        const summary =
-          buildSummary(
-            hasMore,
-            response.results.length,
-          );
-
+        const summary = buildSummary(hasMore, response.results.length);
         const status =
-          progress.failureCount > 0
-            ? "Failed"
-            : "Success";
+          progress.failureCount > 0 ? "Failed" : "Success";
 
-        if (
-          hasMore &&
-          response.next_cursor
-        ) {
+        if (hasMore && response.next_cursor) {
           return {
-            changes: [
-              buildRunChange(
-                status,
-                summary,
-              ),
-            ],
+            changes: [buildRunChange(status, summary)],
             hasMore: true,
             nextState: {
               ...progress,
-              cursor:
-                response.next_cursor,
+              cursor: response.next_cursor,
             },
           };
         }
 
         return {
-          changes: [
-            buildRunChange(
-              status,
-              summary,
-            ),
-          ],
+          changes: [buildRunChange(status, summary)],
           hasMore: false,
         };
       } catch (error) {
-        const reason =
-          getErrorMessage(
-            error,
-            "Unknown paginated refresh error.",
-          );
-
         recordFailure(
           "(batch)",
-          reason,
+          getErrorMessage(error, "Unknown paginated refresh error."),
           0,
         );
 
@@ -933,12 +759,28 @@ function registerScalableStockTrackerCapability(
   });
 }
 
+/* Retained manual controls */
 registerScalableStockTrackerCapability(
   "stockTrackerFullDryRun",
   false,
+  "manual",
 );
 
 registerScalableStockTrackerCapability(
   "stockTrackerFullRefresh",
   true,
+  "manual",
 );
+
+/*
+ * Native schedule:
+ * - Notion invokes this lightweight capability every five minutes.
+ * - It performs the actual full refresh only in the two Chicago-time windows.
+ */
+registerScalableStockTrackerCapability(
+  "stockTrackerScheduledRefresh",
+  true,
+  "5m",
+  true,
+);
+
