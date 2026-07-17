@@ -906,3 +906,243 @@ registerNonOwnedBatchCapability(
   TEN_SYMBOL_TEST,
   true,
 );
+
+const ownedFinnhubPacer = worker.pacer("ownedFinnhubPacer", {
+  allowedRequests: 1,
+  intervalMs: 1100,
+});
+
+const ownedNotionWritePacer = worker.pacer("ownedNotionWritePacer", {
+  allowedRequests: 1,
+  intervalMs: 400,
+});
+
+function registerOwnedPositionCapability(
+  capabilityKey: string,
+  performWrite: boolean,
+) {
+  worker.sync(capabilityKey, {
+    database: stockRefreshRuns,
+    mode: "incremental",
+    schedule: "manual",
+    execute: async (_state, { notion }) => {
+      const startedAt = Date.now();
+      const executedAt = new Date().toISOString();
+      const mode = performWrite ? "write" : "dry-run";
+      const runId = `owned-${mode}-${executedAt}`;
+
+      let rowsDiscovered = 0;
+      let quotesReceived = 0;
+      let writesPerformed = 0;
+      let currentSymbol: string | null = null;
+
+      try {
+        const searchResponse = await notion.search({
+          filter: {
+            property: "object",
+            value: "data_source",
+          },
+          page_size: 10,
+        });
+
+        if (searchResponse.results.length !== 1) {
+          throw new Error(
+            `Expected exactly one accessible data source; found ${searchResponse.results.length}.`,
+          );
+        }
+
+        const dataSourceId = searchResponse.results[0].id;
+        const ownedRows: Array<{
+          pageId: string;
+          symbol: string;
+        }> = [];
+
+        let cursor: string | undefined;
+
+        do {
+          const response = await notion.dataSources.query({
+            data_source_id: dataSourceId,
+            filter: {
+              property: "Owned",
+              checkbox: {
+                equals: true,
+              },
+            },
+            page_size: 100,
+            start_cursor: cursor,
+          });
+
+          for (const result of response.results) {
+            const page = result as {
+              id: string;
+              properties: Record<string, unknown>;
+            };
+
+            const symbol = extractSymbol(page);
+
+            if (!symbol) {
+              throw new Error(
+                `Owned row ${page.id} has a blank or invalid Symbol.`,
+              );
+            }
+
+            ownedRows.push({
+              pageId: page.id,
+              symbol,
+            });
+          }
+
+          cursor =
+            response.has_more && response.next_cursor
+              ? response.next_cursor
+              : undefined;
+        } while (cursor);
+
+        rowsDiscovered = ownedRows.length;
+
+        if (rowsDiscovered === 0) {
+          throw new Error("No owned Stock Tracker rows were found.");
+        }
+
+        const symbolCounts = new Map<string, number>();
+
+        for (const row of ownedRows) {
+          symbolCounts.set(
+            row.symbol,
+            (symbolCounts.get(row.symbol) ?? 0) + 1,
+          );
+        }
+
+        const uniqueSymbols = [...symbolCounts.keys()].sort();
+        const duplicateSymbols = [...symbolCounts.entries()]
+          .filter(([, count]) => count > 1)
+          .map(([symbol, count]) => ({ symbol, count }));
+
+        const quoteBySymbol = new Map<string, Quote>();
+
+        for (const symbol of uniqueSymbols) {
+          currentSymbol = symbol;
+          await ownedFinnhubPacer.wait();
+
+          const quote = await fetchFinnhubQuote(symbol);
+          quoteBySymbol.set(symbol, quote);
+          quotesReceived += 1;
+        }
+
+        currentSymbol = null;
+
+        const plans = ownedRows.map((row) => {
+          const quote = quoteBySymbol.get(row.symbol);
+
+          if (!quote) {
+            throw new Error(
+              `No validated quote exists for owned symbol ${row.symbol}.`,
+            );
+          }
+
+          return {
+            pageId: row.pageId,
+            symbol: row.symbol,
+            marketPrice: quote.marketPrice,
+            dayChangeDecimal: quote.dayChangeDecimal,
+            snapshotDate: toChicagoDate(quote.quotedAt),
+          };
+        });
+
+        if (performWrite) {
+          for (const plan of plans) {
+            await ownedNotionWritePacer.wait();
+
+            await notion.pages.update({
+              page_id: plan.pageId,
+              properties: {
+                "Market Price": {
+                  number: plan.marketPrice,
+                },
+                "Day Change %": {
+                  number: plan.dayChangeDecimal,
+                },
+                "Snapshot Date": {
+                  date: {
+                    start: plan.snapshotDate,
+                  },
+                },
+              },
+            });
+
+            writesPerformed += 1;
+          }
+        }
+
+        const summary = {
+          test: "Owned-position refresh",
+          mode,
+          rowsDiscovered,
+          uniqueSymbols: uniqueSymbols.length,
+          symbolsQuoted: uniqueSymbols,
+          duplicateSymbols,
+          quotesReceived,
+          rowsPlanned: plans.length,
+          rowsSkipped: 0,
+          failures: [],
+          propertiesTargeted: [
+            "Market Price",
+            "Day Change %",
+            "Snapshot Date",
+          ],
+          writesPerformed,
+          runtimeMs: Date.now() - startedAt,
+        };
+
+        return {
+          changes: [
+            {
+              type: "upsert" as const,
+              key: runId,
+              properties: {
+                "Run ID": Builder.title(runId),
+                Status: Builder.select("Success"),
+                "Executed At": Builder.richText(executedAt),
+                Summary: Builder.richText(JSON.stringify(summary)),
+              },
+            },
+          ],
+          hasMore: false,
+        };
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Unknown owned-position refresh error.";
+
+        return {
+          changes: [
+            {
+              type: "upsert" as const,
+              key: runId,
+              properties: {
+                "Run ID": Builder.title(runId),
+                Status: Builder.select("Failed"),
+                "Executed At": Builder.richText(executedAt),
+                Summary: Builder.richText(
+                  JSON.stringify({
+                    message,
+                    currentSymbol,
+                    rowsDiscovered,
+                    quotesReceived,
+                    writesPerformed,
+                    runtimeMs: Date.now() - startedAt,
+                  }),
+                ),
+              },
+            },
+          ],
+          hasMore: false,
+        };
+      }
+    },
+  });
+}
+
+registerOwnedPositionCapability("ownedPositionsDryRun", false);
+registerOwnedPositionCapability("ownedPositionsControlledUpdate", true);
