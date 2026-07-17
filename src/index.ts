@@ -449,7 +449,7 @@ function isScheduledRefreshWindow(now = new Date()): boolean {
   const hour = Number(values.hour);
   const minute = Number(values.minute);
 
-  const morningWindow = hour === 10 && minute >= 0 && minute <= 4;
+  const morningWindow = hour === 9 && minute >= 0 && minute <= 4;
   const afternoonWindow = hour === 15 && minute >= 10 && minute <= 14;
 
   return morningWindow || afternoonWindow;
@@ -783,4 +783,5 @@ registerScalableStockTrackerCapability(
   "5m",
   true,
 );
+
 
