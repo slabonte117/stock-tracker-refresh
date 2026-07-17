@@ -507,3 +507,202 @@ function registerAaplUpdateCapability(
 
 registerAaplUpdateCapability("aaplUpdateDryRun", false);
 registerAaplUpdateCapability("aaplControlledUpdate", true);
+
+function registerTwoSymbolUpdateCapability(
+  capabilityKey: string,
+  performWrite: boolean,
+) {
+  worker.sync(capabilityKey, {
+    database: stockRefreshRuns,
+    mode: "incremental",
+    schedule: "manual",
+    execute: async (_state, { notion }) => {
+      const executedAt = new Date().toISOString();
+      const mode = performWrite ? "write" : "dry-run";
+      const runId = `two-symbol-${mode}-${executedAt}`;
+      let writesPerformed = 0;
+
+      try {
+        const searchResponse = await notion.search({
+          filter: {
+            property: "object",
+            value: "data_source",
+          },
+          page_size: 10,
+        });
+
+        if (searchResponse.results.length !== 1) {
+          throw new Error(
+            `Expected exactly one accessible data source; found ${searchResponse.results.length}.`,
+          );
+        }
+
+        const dataSourceId = searchResponse.results[0].id;
+        const plans: Array<{
+          symbol: string;
+          pageId: string;
+          before: {
+            marketPrice: number | null;
+            dayChangeDecimal: number | null;
+            snapshotDate: string | null;
+          };
+          proposed: {
+            marketPrice: number;
+            dayChangeDecimal: number;
+            snapshotDate: string;
+          };
+        }> = [];
+
+        for (const symbol of ["AAPL", "TSLA"]) {
+          const queryResponse = await notion.dataSources.query({
+            data_source_id: dataSourceId,
+            filter: {
+              property: "Symbol",
+              title: {
+                equals: symbol,
+              },
+            },
+            page_size: 10,
+          });
+
+          if (queryResponse.results.length !== 1) {
+            throw new Error(
+              `Expected exactly one ${symbol} row; found ${queryResponse.results.length}.`,
+            );
+          }
+
+          const page = queryResponse.results[0] as {
+            id: string;
+            properties: Record<string, unknown>;
+          };
+
+          const owned =
+            (
+              page.properties.Owned as
+                | { type?: string; checkbox?: boolean }
+                | undefined
+            )?.checkbox ?? null;
+
+          if (owned !== false) {
+            throw new Error(
+              `${symbol} is not confirmed as non-owned. Batch blocked.`,
+            );
+          }
+
+          const quote = await fetchFinnhubQuote(symbol);
+
+          plans.push({
+            symbol,
+            pageId: page.id,
+            before: {
+              marketPrice:
+                (
+                  page.properties["Market Price"] as
+                    | { number?: number | null }
+                    | undefined
+                )?.number ?? null,
+              dayChangeDecimal:
+                (
+                  page.properties["Day Change %"] as
+                    | { number?: number | null }
+                    | undefined
+                )?.number ?? null,
+              snapshotDate:
+                (
+                  page.properties["Snapshot Date"] as
+                    | { date?: { start?: string } | null }
+                    | undefined
+                )?.date?.start ?? null,
+            },
+            proposed: {
+              marketPrice: quote.marketPrice,
+              dayChangeDecimal: quote.dayChangeDecimal,
+              snapshotDate: toChicagoDate(quote.quotedAt),
+            },
+          });
+        }
+
+        if (performWrite) {
+          for (const plan of plans) {
+            await notion.pages.update({
+              page_id: plan.pageId,
+              properties: {
+                "Market Price": {
+                  number: plan.proposed.marketPrice,
+                },
+                "Day Change %": {
+                  number: plan.proposed.dayChangeDecimal,
+                },
+                "Snapshot Date": {
+                  date: {
+                    start: plan.proposed.snapshotDate,
+                  },
+                },
+              },
+            });
+
+            writesPerformed += 1;
+          }
+        }
+
+        const summary = {
+          test: "Two-symbol controlled update",
+          mode,
+          symbols: ["AAPL", "TSLA"],
+          plans,
+          propertiesTargeted: [
+            "Market Price",
+            "Day Change %",
+            "Snapshot Date",
+          ],
+          writesPerformed,
+        };
+
+        return {
+          changes: [
+            {
+              type: "upsert" as const,
+              key: runId,
+              properties: {
+                "Run ID": Builder.title(runId),
+                Status: Builder.select("Success"),
+                "Executed At": Builder.richText(executedAt),
+                Summary: Builder.richText(JSON.stringify(summary)),
+              },
+            },
+          ],
+          hasMore: false,
+        };
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Unknown two-symbol update error.";
+
+        return {
+          changes: [
+            {
+              type: "upsert" as const,
+              key: runId,
+              properties: {
+                "Run ID": Builder.title(runId),
+                Status: Builder.select("Failed"),
+                "Executed At": Builder.richText(executedAt),
+                Summary: Builder.richText(
+                  JSON.stringify({
+                    message,
+                    writesPerformed,
+                  }),
+                ),
+              },
+            },
+          ],
+          hasMore: false,
+        };
+      }
+    },
+  });
+}
+
+registerTwoSymbolUpdateCapability("twoSymbolUpdateDryRun", false);
+registerTwoSymbolUpdateCapability("twoSymbolControlledUpdate", true);
