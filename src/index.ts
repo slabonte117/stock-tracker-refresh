@@ -437,6 +437,7 @@ function toChicagoDate(isoTimestamp: string): string {
 function isScheduledRefreshWindow(now = new Date()): boolean {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/Chicago",
+    weekday: "short",
     hour: "2-digit",
     minute: "2-digit",
     hourCycle: "h23",
@@ -446,13 +447,16 @@ function isScheduledRefreshWindow(now = new Date()): boolean {
     parts.map((part) => [part.type, part.value]),
   );
 
+  const weekday = values.weekday;
   const hour = Number(values.hour);
   const minute = Number(values.minute);
+
+  const isWeekday = weekday !== "Sat" && weekday !== "Sun";
 
   const morningWindow = hour === 9 && minute >= 0 && minute <= 4;
   const afternoonWindow = hour === 15 && minute >= 10 && minute <= 14;
 
-  return morningWindow || afternoonWindow;
+  return isWeekday && (morningWindow || afternoonWindow);
 }
 
 function registerScalableStockTrackerCapability(
@@ -783,5 +787,6 @@ registerScalableStockTrackerCapability(
   "5m",
   true,
 );
+
 
 
