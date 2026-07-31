@@ -25,17 +25,33 @@ type RetryCallback = (details: {
   status?: number;
 }) => void;
 
+type SellSignal = "Sell" | "Hold";
+
+/*
+ * One Stock Tracker row eligible for a write. Owned and targetSellPrice are
+ * captured per page, not per symbol, because duplicate symbols (QQQI is held
+ * in three accounts) can differ in both.
+ */
+type TargetRow = {
+  pageId: string;
+  owned: boolean;
+  targetSellPrice: number | null;
+};
+
 type StockTrackerRefreshState = {
   cursor?: string;
   runId: string;
   startedAt: string;
   batchNumber: number;
   rowsDiscovered: number;
+  rowsExcluded: number;
   quotesRequested: number;
   quotesReceived: number;
   rowsPlanned: number;
   rowsUpdated: number;
   rowsSkipped: number;
+  staleQuoteCount: number;
+  sellSignalsSet: number;
   failureCount: number;
   finnhubRetries: number;
   notionRetries: number;
@@ -43,6 +59,12 @@ type StockTrackerRefreshState = {
     symbol: string;
     reason: string;
   }>;
+  excludedSamples: Array<{
+    pageId: string;
+    symbol: string;
+    reason: string;
+  }>;
+  processedPageIds: string[];
   symbolCounts: Record<string, number>;
 };
 
@@ -73,13 +95,10 @@ const scalableFinnhubPacer = worker.pacer("scalableFinnhubPacer", {
   intervalMs: 2000,
 });
 
-const scalableNotionWritePacer = worker.pacer(
-  "scalableNotionWritePacer",
-  {
-    allowedRequests: 1,
-    intervalMs: 400,
-  },
-);
+const scalableNotionWritePacer = worker.pacer("scalableNotionWritePacer", {
+  allowedRequests: 1,
+  intervalMs: 400,
+});
 
 function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => {
@@ -203,17 +222,12 @@ async function withNotionRetry<T>(
   operationName: string,
   onRetry?: RetryCallback,
 ): Promise<T> {
-  for (
-    let attempt = 1;
-    attempt <= NOTION_MAX_ATTEMPTS;
-    attempt += 1
-  ) {
+  for (let attempt = 1; attempt <= NOTION_MAX_ATTEMPTS; attempt += 1) {
     try {
       return await operation();
     } catch (error) {
       const status = getErrorStatus(error);
-      const retryable =
-        status === undefined || isRetryableStatus(status);
+      const retryable = status === undefined || isRetryableStatus(status);
 
       if (!retryable || attempt === NOTION_MAX_ATTEMPTS) {
         throw new Error(
@@ -260,11 +274,7 @@ async function fetchFinnhubQuote(
   const url = new URL("https://finnhub.io/api/v1/quote");
   url.searchParams.set("symbol", symbol);
 
-  for (
-    let attempt = 1;
-    attempt <= FINNHUB_MAX_ATTEMPTS;
-    attempt += 1
-  ) {
+  for (let attempt = 1; attempt <= FINNHUB_MAX_ATTEMPTS; attempt += 1) {
     let response: Response;
 
     try {
@@ -405,6 +415,105 @@ function extractSymbol(page: unknown): string {
     .toUpperCase();
 }
 
+/*
+ * Reads a checkbox property. A missing or wrongly typed property is treated
+ * as false so a schema change can never be misread as "owned".
+ */
+function extractCheckbox(page: unknown, propertyName: string): boolean {
+  const properties = (
+    page as {
+      properties?: Record<string, unknown>;
+    }
+  ).properties;
+
+  const property = properties?.[propertyName] as
+    | {
+        type?: string;
+        checkbox?: unknown;
+      }
+    | undefined;
+
+  if (property?.type !== "checkbox") {
+    return false;
+  }
+
+  return property.checkbox === true;
+}
+
+/*
+ * Reads a number property. Missing, null, or non-finite values return null so
+ * they stay distinguishable from a legitimate zero.
+ */
+function extractNumber(page: unknown, propertyName: string): number | null {
+  const properties = (
+    page as {
+      properties?: Record<string, unknown>;
+    }
+  ).properties;
+
+  const property = properties?.[propertyName] as
+    | {
+        type?: string;
+        number?: unknown;
+      }
+    | undefined;
+
+  if (property?.type !== "number") {
+    return null;
+  }
+
+  if (
+    typeof property.number !== "number" ||
+    !Number.isFinite(property.number)
+  ) {
+    return null;
+  }
+
+  return property.number;
+}
+
+/*
+ * Sell Signal is recomputed from scratch every run, in both directions, so a
+ * position that falls back below its target returns to Hold and can fire a
+ * genuine Hold -> Sell transition again later.
+ *
+ * - owned, target set, price >= target -> "Sell"
+ * - owned, target set, price <  target -> "Hold"
+ * - not owned, or no target            -> null (property is cleared)
+ */
+function computeSellSignal(
+  owned: boolean,
+  targetSellPrice: number | null,
+  marketPrice: number,
+): SellSignal | null {
+  if (!owned || targetSellPrice === null) {
+    return null;
+  }
+
+  return marketPrice >= targetSellPrice ? "Sell" : "Hold";
+}
+
+/*
+ * An unfiltered dataSources.query returns archived and trashed pages. They are
+ * invisible in every view and must never be written to.
+ */
+function getPageExclusionReason(page: unknown): string | null {
+  const candidate = page as {
+    archived?: unknown;
+    in_trash?: unknown;
+  };
+
+  if (candidate.archived === true) {
+    return "archived";
+  }
+
+  if (candidate.in_trash === true) {
+    return "in_trash";
+  }
+
+  return null;
+}
+
 function toChicagoDate(isoTimestamp: string): string {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/Chicago",
@@ -418,7 +527,7 @@ function toChicagoDate(isoTimestamp: string): string {
   );
 
   if (!values.year || !values.month || !values.day) {
-    throw new Error("Could not convert quote timestamp to a Chicago date.");
+    throw new Error("Could not convert timestamp to a Chicago date.");
   }
 
   return `${values.year}-${values.month}-${values.day}`;
@@ -428,11 +537,11 @@ function toChicagoDate(isoTimestamp: string): string {
  * Native sync schedules are interval-only. This function enforces the
  * business-time rule in America/Chicago:
  *
- * - 10:00 through 10:04 a.m.
+ * - 9:00 through 9:04 a.m.
  * - 3:10 through 3:14 p.m.
  *
- * A started multi-batch run continues regardless of the clock so it cannot
- * be abandoned halfway through its 75-row refresh.
+ * A started multi-batch run continues regardless of the clock so it cannot be
+ * abandoned halfway through its refresh.
  */
 function isScheduledRefreshWindow(now = new Date()): boolean {
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -496,9 +605,14 @@ function registerScalableStockTrackerCapability(
       const progress: StockTrackerRefreshState = previous
         ? {
             ...previous,
+            rowsExcluded: previous.rowsExcluded ?? 0,
+            staleQuoteCount: previous.staleQuoteCount ?? 0,
+            sellSignalsSet: previous.sellSignalsSet ?? 0,
             finnhubRetries: previous.finnhubRetries ?? 0,
             notionRetries: previous.notionRetries ?? 0,
             failureSamples: [...previous.failureSamples],
+            excludedSamples: [...(previous.excludedSamples ?? [])],
+            processedPageIds: [...(previous.processedPageIds ?? [])],
             symbolCounts: { ...previous.symbolCounts },
           }
         : {
@@ -506,17 +620,33 @@ function registerScalableStockTrackerCapability(
             startedAt,
             batchNumber: 0,
             rowsDiscovered: 0,
+            rowsExcluded: 0,
             quotesRequested: 0,
             quotesReceived: 0,
             rowsPlanned: 0,
             rowsUpdated: 0,
             rowsSkipped: 0,
+            staleQuoteCount: 0,
+            sellSignalsSet: 0,
             failureCount: 0,
             finnhubRetries: 0,
             notionRetries: 0,
             failureSamples: [],
+            excludedSamples: [],
+            processedPageIds: [],
             symbolCounts: {},
           };
+
+      /*
+       * The snapshot stamp is the date the refresh ran, in Chicago time, held
+       * constant across every continuation batch. It is deliberately NOT
+       * derived from the Finnhub quote timestamp: an illiquid symbol can
+       * return a quote stamped with the previous session, which made freshly
+       * written rows appear a full day stale. Quote freshness is reported
+       * separately as staleQuoteCount.
+       */
+      const runDate = toChicagoDate(progress.startedAt);
+      const seenPageIds = new Set(progress.processedPageIds);
 
       const recordRetry: RetryCallback = (details) => {
         if (details.service === "Finnhub") {
@@ -539,6 +669,18 @@ function registerScalableStockTrackerCapability(
         }
       };
 
+      const recordExclusion = (
+        pageId: string,
+        symbol: string,
+        reason: string,
+      ) => {
+        progress.rowsExcluded += 1;
+
+        if (progress.excludedSamples.length < 25) {
+          progress.excludedSamples.push({ pageId, symbol, reason });
+        }
+      };
+
       const buildSummary = (hasMore: boolean, batchRows: number) => {
         const duplicateSymbols = Object.entries(progress.symbolCounts)
           .filter(([, count]) => count > 1)
@@ -548,29 +690,35 @@ function registerScalableStockTrackerCapability(
           test: "Paginated full Stock Tracker refresh",
           mode: onlyRunInScheduledWindow ? "scheduled-write" : mode,
           schedule: onlyRunInScheduledWindow
-            ? "America/Chicago 10:00 and 15:10"
+            ? "America/Chicago 09:00 and 15:10"
             : "manual",
+          runDate,
           batchNumber: progress.batchNumber,
           batchRows,
           hasMore,
           cumulative: {
             rowsDiscovered: progress.rowsDiscovered,
+            rowsExcluded: progress.rowsExcluded,
             uniqueSymbols: Object.keys(progress.symbolCounts).length,
             quotesRequested: progress.quotesRequested,
             quotesReceived: progress.quotesReceived,
             rowsPlanned: progress.rowsPlanned,
             rowsUpdated: progress.rowsUpdated,
             rowsSkipped: progress.rowsSkipped,
+            staleQuoteCount: progress.staleQuoteCount,
+            sellSignalsSet: progress.sellSignalsSet,
             failureCount: progress.failureCount,
             finnhubRetries: progress.finnhubRetries,
             notionRetries: progress.notionRetries,
           },
           duplicateSymbols,
           failureSamples: progress.failureSamples,
+          excludedSamples: progress.excludedSamples,
           propertiesTargeted: [
             "Market Price",
             "Day Change %",
             "Snapshot Date",
+            "Sell Signal",
           ],
           runtimeMs: Date.now() - Date.parse(progress.startedAt),
         };
@@ -623,7 +771,7 @@ function registerScalableStockTrackerCapability(
 
         progress.batchNumber += 1;
 
-        const groupedRows = new Map<string, string[]>();
+        const groupedRows = new Map<string, TargetRow[]>();
 
         for (const result of response.results) {
           const page = result as {
@@ -631,9 +779,33 @@ function registerScalableStockTrackerCapability(
             properties: Record<string, unknown>;
           };
 
-          progress.rowsDiscovered += 1;
-
           const symbol = extractSymbol(page);
+
+          /*
+           * Guard 1: never write the same page twice. An overlapping
+           * continuation cursor, or a row created mid-run, would otherwise be
+           * counted and written again.
+           */
+          if (seenPageIds.has(page.id)) {
+            recordExclusion(page.id, symbol || "(blank)", "duplicate_page_id");
+            continue;
+          }
+
+          /*
+           * Guard 2: skip archived and trashed pages, and sample them into the
+           * run record so they identify themselves without another
+           * investigation.
+           */
+          const exclusionReason = getPageExclusionReason(result);
+
+          if (exclusionReason !== null) {
+            seenPageIds.add(page.id);
+            recordExclusion(page.id, symbol || "(blank)", exclusionReason);
+            continue;
+          }
+
+          seenPageIds.add(page.id);
+          progress.rowsDiscovered += 1;
 
           if (!symbol) {
             recordFailure(
@@ -647,12 +819,18 @@ function registerScalableStockTrackerCapability(
           progress.symbolCounts[symbol] =
             (progress.symbolCounts[symbol] ?? 0) + 1;
 
-          const pageIds = groupedRows.get(symbol) ?? [];
-          pageIds.push(page.id);
-          groupedRows.set(symbol, pageIds);
+          const rows = groupedRows.get(symbol) ?? [];
+
+          rows.push({
+            pageId: page.id,
+            owned: extractCheckbox(page, "Owned"),
+            targetSellPrice: extractNumber(page, "Target Sell Price"),
+          });
+
+          groupedRows.set(symbol, rows);
         }
 
-        for (const [symbol, pageIds] of groupedRows.entries()) {
+        for (const [symbol, rows] of groupedRows.entries()) {
           progress.quotesRequested += 1;
 
           try {
@@ -661,22 +839,35 @@ function registerScalableStockTrackerCapability(
             const quote = await fetchFinnhubQuote(symbol, recordRetry);
 
             progress.quotesReceived += 1;
-            progress.rowsPlanned += pageIds.length;
+            progress.rowsPlanned += rows.length;
+
+            /*
+             * Quote freshness is measured rather than silently baked into
+             * Snapshot Date. A non-zero staleQuoteCount means the provider
+             * served a previous-session timestamp for that symbol.
+             */
+            if (toChicagoDate(quote.quotedAt) !== runDate) {
+              progress.staleQuoteCount += 1;
+            }
 
             if (!performWrite) {
               continue;
             }
 
-            const snapshotDate = toChicagoDate(quote.quotedAt);
+            for (const row of rows) {
+              const sellSignal = computeSellSignal(
+                row.owned,
+                row.targetSellPrice,
+                quote.marketPrice,
+              );
 
-            for (const pageId of pageIds) {
               try {
                 await scalableNotionWritePacer.wait();
 
                 await withNotionRetry(
                   () =>
                     notion.pages.update({
-                      page_id: pageId,
+                      page_id: row.pageId,
                       properties: {
                         "Market Price": {
                           number: quote.marketPrice,
@@ -686,9 +877,18 @@ function registerScalableStockTrackerCapability(
                         },
                         "Snapshot Date": {
                           date: {
-                            start: snapshotDate,
+                            start: runDate,
                           },
                         },
+                        /*
+                         * Written in the same call as price and day change so
+                         * a partial update stays impossible: the signal can
+                         * never disagree with the price it came from.
+                         */
+                        "Sell Signal":
+                          sellSignal === null
+                            ? { select: null }
+                            : { select: { name: sellSignal } },
                       },
                     }),
                   `Notion update for ${symbol}`,
@@ -696,13 +896,14 @@ function registerScalableStockTrackerCapability(
                 );
 
                 progress.rowsUpdated += 1;
+
+                if (sellSignal === "Sell") {
+                  progress.sellSignalsSet += 1;
+                }
               } catch (error) {
                 recordFailure(
                   symbol,
-                  getErrorMessage(
-                    error,
-                    "Unknown Notion update error.",
-                  ),
+                  getErrorMessage(error, "Unknown Notion update error."),
                   1,
                 );
               }
@@ -715,17 +916,17 @@ function registerScalableStockTrackerCapability(
             recordFailure(
               symbol,
               getErrorMessage(error, "Unknown Finnhub quote error."),
-              pageIds.length,
+              rows.length,
             );
           }
         }
 
-        const hasMore =
-          response.has_more && response.next_cursor !== null;
+        progress.processedPageIds = Array.from(seenPageIds);
+
+        const hasMore = response.has_more && response.next_cursor !== null;
 
         const summary = buildSummary(hasMore, response.results.length);
-        const status =
-          progress.failureCount > 0 ? "Failed" : "Success";
+        const status = progress.failureCount > 0 ? "Failed" : "Success";
 
         if (hasMore && response.next_cursor) {
           return {
@@ -743,6 +944,8 @@ function registerScalableStockTrackerCapability(
           hasMore: false,
         };
       } catch (error) {
+        progress.processedPageIds = Array.from(seenPageIds);
+
         recordFailure(
           "(batch)",
           getErrorMessage(error, "Unknown paginated refresh error."),
@@ -750,12 +953,7 @@ function registerScalableStockTrackerCapability(
         );
 
         return {
-          changes: [
-            buildRunChange(
-              "Failed",
-              buildSummary(false, 0),
-            ),
-          ],
+          changes: [buildRunChange("Failed", buildSummary(false, 0))],
           hasMore: false,
         };
       }
@@ -780,6 +978,8 @@ registerScalableStockTrackerCapability(
  * Native schedule:
  * - Notion invokes this lightweight capability every five minutes.
  * - It performs the actual full refresh only in the two Chicago-time windows.
+ * - Paused in production since 2026-07-19; the external cron wrapper on
+ *   debian-docker is the live trigger. Retained as a resumable fallback.
  */
 registerScalableStockTrackerCapability(
   "stockTrackerScheduledRefresh",
@@ -787,6 +987,3 @@ registerScalableStockTrackerCapability(
   "5m",
   true,
 );
-
-
-
