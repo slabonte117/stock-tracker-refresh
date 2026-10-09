@@ -53,6 +53,12 @@ type StockTrackerRefreshState = {
   staleQuoteCount: number;
   sellSignalsSet: number;
   failureCount: number;
+  unsupportedCount: number;
+  rowsUnsupported: number;
+  unsupportedSamples: Array<{
+    symbol: string;
+    reason: string;
+  }>;
   finnhubRetries: number;
   notionRetries: number;
   failureSamples: Array<{
@@ -67,6 +73,23 @@ type StockTrackerRefreshState = {
   processedPageIds: string[];
   symbolCounts: Record<string, number>;
 };
+
+/*
+ * Finnhub answers HTTP 403 for a single symbol when the account's plan does
+ * not cover that instrument (for example mutual funds such as FXAIX and
+ * FFLDX on the free plan). That is permanent and per-symbol, so it is
+ * recorded as "unsupported" and does not fail the run. A revoked or invalid
+ * key also returns 403, but then every symbol fails; the run-status guard
+ * (no quote received at all) still marks that case Failed.
+ */
+export class FinnhubUnsupportedSymbolError extends Error {
+  constructor(symbol: string) {
+    super(
+      `Finnhub returned HTTP 403 for ${symbol}: the instrument is not covered by the current Finnhub plan.`,
+    );
+    this.name = "FinnhubUnsupportedSymbolError";
+  }
+}
 
 const FINNHUB_MAX_ATTEMPTS = 3;
 const NOTION_MAX_ATTEMPTS = 3;
@@ -261,7 +284,7 @@ async function withNotionRetry<T>(
   throw new Error(`${operationName} ended unexpectedly.`);
 }
 
-async function fetchFinnhubQuote(
+export async function fetchFinnhubQuote(
   symbol: string,
   onRetry?: RetryCallback,
 ): Promise<Quote> {
@@ -306,6 +329,10 @@ async function fetchFinnhubQuote(
     }
 
     if (!response.ok) {
+      if (response.status === 403) {
+        throw new FinnhubUnsupportedSymbolError(symbol);
+      }
+
       if (
         !isRetryableStatus(response.status) ||
         attempt === FINNHUB_MAX_ATTEMPTS
@@ -610,6 +637,9 @@ function registerScalableStockTrackerCapability(
             sellSignalsSet: previous.sellSignalsSet ?? 0,
             finnhubRetries: previous.finnhubRetries ?? 0,
             notionRetries: previous.notionRetries ?? 0,
+            unsupportedCount: previous.unsupportedCount ?? 0,
+            rowsUnsupported: previous.rowsUnsupported ?? 0,
+            unsupportedSamples: [...(previous.unsupportedSamples ?? [])],
             failureSamples: [...previous.failureSamples],
             excludedSamples: [...(previous.excludedSamples ?? [])],
             processedPageIds: [...(previous.processedPageIds ?? [])],
@@ -629,6 +659,9 @@ function registerScalableStockTrackerCapability(
             staleQuoteCount: 0,
             sellSignalsSet: 0,
             failureCount: 0,
+            unsupportedCount: 0,
+            rowsUnsupported: 0,
+            unsupportedSamples: [],
             finnhubRetries: 0,
             notionRetries: 0,
             failureSamples: [],
@@ -666,6 +699,19 @@ function registerScalableStockTrackerCapability(
 
         if (progress.failureSamples.length < 25) {
           progress.failureSamples.push({ symbol, reason });
+        }
+      };
+
+      const recordUnsupported = (
+        symbol: string,
+        reason: string,
+        skippedRows: number,
+      ) => {
+        progress.unsupportedCount += 1;
+        progress.rowsUnsupported += skippedRows;
+
+        if (progress.unsupportedSamples.length < 25) {
+          progress.unsupportedSamples.push({ symbol, reason });
         }
       };
 
@@ -708,11 +754,14 @@ function registerScalableStockTrackerCapability(
             staleQuoteCount: progress.staleQuoteCount,
             sellSignalsSet: progress.sellSignalsSet,
             failureCount: progress.failureCount,
+            unsupportedQuotes: progress.unsupportedCount,
+            rowsUnsupported: progress.rowsUnsupported,
             finnhubRetries: progress.finnhubRetries,
             notionRetries: progress.notionRetries,
           },
           duplicateSymbols,
           failureSamples: progress.failureSamples,
+          unsupportedSamples: progress.unsupportedSamples,
           excludedSamples: progress.excludedSamples,
           propertiesTargeted: [
             "Market Price",
@@ -913,6 +962,11 @@ function registerScalableStockTrackerCapability(
              * No write happens for this symbol after a quote failure.
              * Existing market values remain intact.
              */
+            if (error instanceof FinnhubUnsupportedSymbolError) {
+              recordUnsupported(symbol, error.message, rows.length);
+              continue;
+            }
+
             recordFailure(
               symbol,
               getErrorMessage(error, "Unknown Finnhub quote error."),
@@ -926,7 +980,15 @@ function registerScalableStockTrackerCapability(
         const hasMore = response.has_more && response.next_cursor !== null;
 
         const summary = buildSummary(hasMore, response.results.length);
-        const status = progress.failureCount > 0 ? "Failed" : "Success";
+        /*
+         * Unsupported symbols are reported in the summary but do not fail the
+         * run. Zero quotes received out of at least one requested still does:
+         * that pattern means the key or plan is broken, not one instrument.
+         */
+        const noQuotesReceived =
+          progress.quotesRequested > 0 && progress.quotesReceived === 0;
+        const status =
+          progress.failureCount > 0 || noQuotesReceived ? "Failed" : "Success";
 
         if (hasMore && response.next_cursor) {
           return {
